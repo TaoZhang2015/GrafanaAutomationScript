@@ -23,9 +23,18 @@ const ANALYSIS_CONFIG = {
   grafanaApiMinIntervalMs: 120,
   grafanaRetryMaxAttempts: 4,
   grafanaRetryBaseDelayMs: 300,
-  step1RangeStartPst: "2026-04-20T00:00:00-00:00",
-  step1RangeEndPst: "2026-04-24T23:59:59-00:00",
-  step3_3ReuseWindowMinutes: 2,
+  step1RangeStartPst: "2026-04-25T06:00:00-00:00",
+  step1RangeEndPst: "2026-04-25T11:59:59-00:00",
+  step3_3ReuseWindowMinutes: 10,
+  step3_3CompletionExtend1Minutes: 15,
+  step3_3CompletionExtend2Minutes: 30,
+  step2AutoSplitOnLimit: true,
+  step2SplitMaxDepth: 8,
+  step2SplitMinWindowMinutes: 60,
+  step2RunMetricCountOnUnsplittableLimitHit: true,
+  step3_3SkipTraceLookupWhenStep2UnsplittableLimitHit: true,
+  step3_3RepeatedTraceWarnThreshold: 2,
+  step3_3RepeatedLinkIdentityWarnThreshold: 2,
 };
 
 const ALL_REGIONS = [
@@ -141,6 +150,14 @@ function formatNsToPst(ns) {
 
 function sleepMs(ms) {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+function shouldLogRepeatCount(count, threshold = 2) {
+  const n = Number(count);
+  const min = Math.max(2, Number(threshold) || 2);
+  if (!Number.isFinite(n) || n < min) return false;
+  if (n === min) return true;
+  return (n & (n - 1)) === 0;
 }
 
 async function throttleGrafanaApiAccess() {
@@ -442,6 +459,118 @@ async function queryLoki(
   throw firstErr || lastErr || new Error("All Loki endpoints failed");
 }
 
+async function queryLokiInstant(expr, { timeNs } = {}) {
+  const region = ACTIVE_REGION;
+  const lokiUid = ACTIVE_REGION_CONFIG.lokiUid;
+  const MAX_ATTEMPTS = Math.max(1, Number(ANALYSIS_CONFIG.grafanaRetryMaxAttempts || 1));
+  const BASE_RETRY_DELAY_MS = Math.max(50, Number(ANALYSIS_CONFIG.grafanaRetryBaseDelayMs || 300));
+  const actualTimeNs = Number.isFinite(Number(timeNs)) ? Math.floor(Number(timeNs)) : Date.now() * 1e6;
+
+  const candidatePaths = [
+    `/api/datasources/proxy/uid/${lokiUid}/loki/api/v1/query`,
+    `/api/datasources/proxy/uid/${lokiUid}/api/v1/query`,
+  ];
+
+  let lastErr = null;
+  for (const path of candidatePaths) {
+    const qs = new URLSearchParams({
+      query: String(expr || ""),
+      time: String(actualTimeNs),
+    }).toString();
+    const url = `${path}?${qs}`;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      try {
+        appendRunLog("LOKI", "instant query start", {
+          region,
+          path,
+          attempt: attempt + 1,
+          maxAttempts: MAX_ATTEMPTS,
+          timeNs: String(actualTimeNs),
+          timePst: formatNsToPst(actualTimeNs),
+          expr: String(expr || ""),
+        });
+        await throttleGrafanaApiAccess();
+        const resp = await fetch(url, { credentials: "include" });
+        if (!resp.ok) {
+          if (shouldRetryGrafanaStatus(resp.status) && attempt < MAX_ATTEMPTS - 1) {
+            const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+            appendRunLog("LOKI", "instant query retry after transient status", {
+              region,
+              path,
+              status: resp.status,
+              attempt: attempt + 1,
+              maxAttempts: MAX_ATTEMPTS,
+              delayMs: delay,
+            });
+            await sleepMs(delay);
+            continue;
+          }
+          const body = await resp.text().catch(() => "");
+          throw new Error(
+            `HTTP ${resp.status} from ${path}${body ? ` | body: ${String(body).slice(0, 600)}` : ""}`,
+          );
+        }
+        const out = await resp.json();
+        appendRunLog("LOKI", "instant query success", {
+          region,
+          path,
+          timeNs: String(actualTimeNs),
+          timePst: formatNsToPst(actualTimeNs),
+          resultType: out?.data?.resultType || null,
+          resultLength: Array.isArray(out?.data?.result) ? out.data.result.length : null,
+          status: out?.status || null,
+        });
+        return out;
+      } catch (e) {
+        if (attempt < MAX_ATTEMPTS - 1) {
+          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+          appendRunLog("LOKI", "instant query retry after exception", {
+            region,
+            path,
+            attempt: attempt + 1,
+            maxAttempts: MAX_ATTEMPTS,
+            delayMs: delay,
+            error: String(e?.message || e),
+          });
+          await sleepMs(delay);
+          continue;
+        }
+        lastErr = e;
+      }
+    }
+  }
+
+  throw lastErr || new Error("All Loki instant-query endpoints failed");
+}
+
+function extractNumericMetricValueFromLokiInstantResponse(metricJson) {
+  const data = metricJson?.data || {};
+  const resultType = String(data?.resultType || "").toLowerCase();
+  const result = data?.result;
+
+  if (resultType === "scalar" && Array.isArray(result) && result.length >= 2) {
+    const n = Number(result[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  if (resultType === "vector" && Array.isArray(result) && result.length > 0) {
+    const n = Number(result?.[0]?.value?.[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Fallback for unexpected wrappers from proxy/plugin transforms.
+  if (Array.isArray(result) && result.length > 0) {
+    const first = result[0];
+    if (Array.isArray(first?.value) && first.value.length >= 2) {
+      const n = Number(first.value[1]);
+      return Number.isFinite(n) ? n : null;
+    }
+  }
+
+  return null;
+}
+
 function lineContains404Status(line) {
   const s = String(line || "");
   const obj = extractJsonObjectFromLogLine(s);
@@ -457,6 +586,234 @@ function buildDecisionSelector(env, pod) {
   const labels = ['container=~"decision"', 'namespace="authz"', `prd_env="${env}"`];
   if (pod) labels.push(`pod="${pod}"`);
   return `{ ${labels.join(", ")} }`;
+}
+
+function filterDecision404StreamsFromLoki(rawStreams, { limit = 3000, sampleCap = 20 } = {}) {
+  let matchedLineCount = 0;
+  const sampleLines = [];
+  const filteredStreams = [];
+
+  for (const stream of rawStreams || []) {
+    const keptValues = [];
+    for (const pair of stream.values || []) {
+      const line = pair?.[1];
+      if (!lineContains404Status(line)) continue;
+      keptValues.push(pair);
+      matchedLineCount += 1;
+      if (sampleLines.length < sampleCap) sampleLines.push(line);
+    }
+    if (keptValues.length) {
+      filteredStreams.push({
+        stream: stream.stream,
+        values: keptValues,
+      });
+    }
+  }
+
+  return {
+    matchedLineCount,
+    streamCount: filteredStreams.length,
+    streams: filteredStreams,
+    sampleLines,
+    isLimitLikelyHit: matchedLineCount >= limit,
+  };
+}
+
+function mergeDecision404ChunkResults(lhs, rhs, sampleCap = 20) {
+  const streamMap = new Map();
+
+  for (const src of [lhs, rhs]) {
+    for (const s of src?.streams || []) {
+      const key = JSON.stringify(s?.stream || {});
+      if (!streamMap.has(key)) {
+        streamMap.set(key, {
+          stream: s?.stream || {},
+          values: [...(s?.values || [])],
+        });
+        continue;
+      }
+      const existing = streamMap.get(key);
+      existing.values.push(...(s?.values || []));
+    }
+  }
+
+  const mergedStreams = [...streamMap.values()];
+  let mergedMatchedLineCount = 0;
+  for (const s of mergedStreams) {
+    mergedMatchedLineCount += Number(s?.values?.length || 0);
+  }
+
+  const mergedSampleLines = [...(lhs?.sampleLines || []), ...(rhs?.sampleLines || [])].slice(0, sampleCap);
+
+  return {
+    streams: mergedStreams,
+    streamCount: mergedStreams.length,
+    matchedLineCount: mergedMatchedLineCount,
+    sampleLines: mergedSampleLines,
+    chunksQueried: Number(lhs?.chunksQueried || 0) + Number(rhs?.chunksQueried || 0),
+    splitCount: Number(lhs?.splitCount || 0) + Number(rhs?.splitCount || 0),
+    maxSplitDepthUsed: Math.max(
+      Number(lhs?.maxSplitDepthUsed || 0),
+      Number(rhs?.maxSplitDepthUsed || 0),
+    ),
+    unsplittableLimitHitCount:
+      Number(lhs?.unsplittableLimitHitCount || 0) + Number(rhs?.unsplittableLimitHitCount || 0),
+    limitHitLeafCount:
+      Number(lhs?.limitHitLeafCount || 0) + Number(rhs?.limitHitLeafCount || 0),
+    metricCountQueryAttempts:
+      Number(lhs?.metricCountQueryAttempts || 0) + Number(rhs?.metricCountQueryAttempts || 0),
+    metricCountQuerySuccessCount:
+      Number(lhs?.metricCountQuerySuccessCount || 0) + Number(rhs?.metricCountQuerySuccessCount || 0),
+    metricCount404EstimateSum:
+      Number(lhs?.metricCount404EstimateSum || 0) + Number(rhs?.metricCount404EstimateSum || 0),
+    isLimitLikelyHit:
+      Boolean(lhs?.isLimitLikelyHit) || Boolean(rhs?.isLimitLikelyHit),
+  };
+}
+
+async function collectDecision404LogsForEnvWithAutoSplit(
+  env,
+  expr,
+  { hours = 24, limit = 3000, startNs = null, endNs = null } = {},
+) {
+  const actualEndNs = endNs ?? Date.now() * 1e6;
+  const actualStartNs = startNs ?? actualEndNs - hours * 60 * 60 * 1e9;
+  const maxSplitDepth = Math.max(0, Number(ANALYSIS_CONFIG.step2SplitMaxDepth || 0));
+  const minSplitWindowNs = Math.max(
+    1,
+    Math.floor((Number(ANALYSIS_CONFIG.step2SplitMinWindowMinutes || 5) || 5) * 60 * 1e9),
+  );
+  const autoSplitEnabled = ANALYSIS_CONFIG.step2AutoSplitOnLimit !== false;
+  const metricCountEnabled = ANALYSIS_CONFIG.step2RunMetricCountOnUnsplittableLimitHit !== false;
+
+  async function fetchWindow(sNs, eNs, depth = 0) {
+    const lokiJson = await queryLokiRange(expr, { hours, limit, startNs: sNs, endNs: eNs });
+    const filtered = filterDecision404StreamsFromLoki(lokiJson?.data?.result || [], { limit });
+    const windowNs = Math.max(0, Number(eNs) - Number(sNs));
+    const canSplit = depth < maxSplitDepth && windowNs > minSplitWindowNs;
+    const shouldSplit = autoSplitEnabled && filtered.isLimitLikelyHit && canSplit;
+
+    if (shouldSplit) {
+      const midNs = Math.floor((Number(sNs) + Number(eNs)) / 2);
+      appendRunLog("STEP2", "split env query window due to limit-hit risk", {
+        env,
+        depth: depth + 1,
+        limit,
+        startNs: String(sNs),
+        endNs: String(eNs),
+        startPst: formatNsToPst(sNs),
+        endPst: formatNsToPst(eNs),
+        midNs: String(midNs),
+        midPst: formatNsToPst(midNs),
+        windowMinutes: Number((windowNs / 60e9).toFixed(3)),
+      });
+      const left = await fetchWindow(sNs, midNs, depth + 1);
+      const right = await fetchWindow(midNs + 1, eNs, depth + 1);
+      const merged = mergeDecision404ChunkResults(left, right);
+      merged.splitCount += 1;
+      merged.maxSplitDepthUsed = Math.max(merged.maxSplitDepthUsed, depth + 1);
+      return merged;
+    }
+
+    const unsplittableLimitHit = filtered.isLimitLikelyHit && !shouldSplit;
+    let metricCount404Estimate = null;
+    let metricCountQueryAttempted = false;
+    let metricCountQuerySucceeded = false;
+    if (unsplittableLimitHit) {
+      appendRunLog("STEP2", "warning: potential missing log entries due to step2 limit-hit leaf", {
+        env,
+        depth,
+        limit,
+        startNs: String(sNs),
+        endNs: String(eNs),
+        startPst: formatNsToPst(sNs),
+        endPst: formatNsToPst(eNs),
+        windowMinutes: Number((windowNs / 60e9).toFixed(3)),
+        maxSplitDepth,
+        minSplitWindowMinutes: Number(ANALYSIS_CONFIG.step2SplitMinWindowMinutes || 5),
+      });
+      console.warn(
+        `STEP2 warning env=${env}: potential missing log entries (matchedLineCount>=${limit}) in unsplittable leaf window ${formatNsToPst(
+          sNs,
+        )} ~ ${formatNsToPst(eNs)}.`,
+      );
+
+      if (metricCountEnabled) {
+        metricCountQueryAttempted = true;
+        const windowSeconds = Math.max(1, Math.ceil(windowNs / 1e9));
+        const metricExpr = `sum(count_over_time(${expr} [${windowSeconds}s]))`;
+        try {
+          const metricJson = await queryLokiInstant(metricExpr, { timeNs: eNs });
+          const n = extractNumericMetricValueFromLokiInstantResponse(metricJson);
+          if (Number.isFinite(n)) {
+            metricCount404Estimate = n;
+            metricCountQuerySucceeded = true;
+          }
+          const metricData = metricJson?.data || {};
+          const metricResult = metricData?.result;
+          let metricResultSample = null;
+          if (Array.isArray(metricResult) && metricResult.length > 0) {
+            metricResultSample = metricResult[0];
+          } else if (metricResult !== undefined) {
+            metricResultSample = metricResult;
+          }
+          appendRunLog("STEP2", "metric fallback query for unsplittable limit-hit leaf completed", {
+            env,
+            depth,
+            startNs: String(sNs),
+            endNs: String(eNs),
+            startPst: formatNsToPst(sNs),
+            endPst: formatNsToPst(eNs),
+            windowSeconds,
+            matchedLineCountAtLimitQuery: filtered.matchedLineCount,
+            limit,
+            metricCount404Estimate,
+            metricCountQuerySucceeded,
+            metricResultType: metricData?.resultType || null,
+            metricResultLength: Array.isArray(metricResult) ? metricResult.length : null,
+            metricResultSample,
+            metricExpr,
+          });
+          if (!metricCountQuerySucceeded) {
+            appendRunLog("STEP2", "warning: metric fallback query returned unparsable value", {
+              env,
+              depth,
+              startNs: String(sNs),
+              endNs: String(eNs),
+              metricExpr,
+              metricResultType: metricData?.resultType || null,
+              metricResultLength: Array.isArray(metricResult) ? metricResult.length : null,
+              metricResultSample,
+            });
+          }
+        } catch (metricErr) {
+          appendRunLog("STEP2", "metric fallback query for unsplittable limit-hit leaf failed", {
+            env,
+            depth,
+            startNs: String(sNs),
+            endNs: String(eNs),
+            startPst: formatNsToPst(sNs),
+            endPst: formatNsToPst(eNs),
+            error: String(metricErr?.message || metricErr),
+          });
+        }
+      }
+    }
+
+    return {
+      ...filtered,
+      chunksQueried: 1,
+      splitCount: 0,
+      maxSplitDepthUsed: depth,
+      unsplittableLimitHitCount: unsplittableLimitHit ? 1 : 0,
+      limitHitLeafCount: filtered.isLimitLikelyHit ? 1 : 0,
+      metricCountQueryAttempts: metricCountQueryAttempted ? 1 : 0,
+      metricCountQuerySuccessCount: metricCountQuerySucceeded ? 1 : 0,
+      metricCount404EstimateSum: Number(metricCount404Estimate || 0),
+    };
+  }
+
+  return fetchWindow(Math.floor(actualStartNs), Math.floor(actualEndNs), 0);
 }
 
 function summarizeDecision404Series(mimirJson) {
@@ -759,43 +1116,57 @@ async function collectDecision404LogsByEnv(
       ` |~ \`"requestHTTPStatusCode":404|"responseStatusCode":404\``;
 
     try {
-      const lokiJson = await queryLokiRange(expr, { hours, limit, startNs, endNs });
-      const rawStreams = lokiJson?.data?.result || [];
-
-      let matchedLineCount = 0;
-      const sampleLines = [];
-      const filteredStreams = [];
-
-      for (const stream of rawStreams) {
-        const keptValues = [];
-        for (const pair of stream.values || []) {
-          const line = pair?.[1];
-          if (!lineContains404Status(line)) continue;
-          keptValues.push(pair);
-          matchedLineCount += 1;
-          if (sampleLines.length < 20) sampleLines.push(line);
-        }
-        if (keptValues.length) {
-          filteredStreams.push({
-            stream: stream.stream,
-            values: keptValues,
-          });
-        }
-      }
+      const splitResult = await collectDecision404LogsForEnvWithAutoSplit(env, expr, {
+        hours,
+        limit,
+        startNs,
+        endNs,
+      });
+      const matchedLineCount = Number(splitResult?.matchedLineCount || 0);
+      const streamCount = Number(splitResult?.streamCount || 0);
+      const filteredStreams = splitResult?.streams || [];
+      const sampleLines = splitResult?.sampleLines || [];
+      const isLimitLikelyHit = Boolean(splitResult?.isLimitLikelyHit);
+      const splitMeta = {
+        chunksQueried: Number(splitResult?.chunksQueried || 0),
+        splitCount: Number(splitResult?.splitCount || 0),
+        maxSplitDepthUsed: Number(splitResult?.maxSplitDepthUsed || 0),
+        limitHitLeafCount: Number(splitResult?.limitHitLeafCount || 0),
+        unsplittableLimitHitCount: Number(splitResult?.unsplittableLimitHitCount || 0),
+        metricCountQueryAttempts: Number(splitResult?.metricCountQueryAttempts || 0),
+        metricCountQuerySuccessCount: Number(splitResult?.metricCountQuerySuccessCount || 0),
+        metricCount404EstimateSum: Number(splitResult?.metricCount404EstimateSum || 0),
+      };
 
       byEnv[env] = {
         lokiQuery: expr,
         matchedLineCount,
-        streamCount: filteredStreams.length,
+        streamCount,
         streams: filteredStreams,
         sampleLines,
-        isLimitLikelyHit: matchedLineCount >= limit,
+        isLimitLikelyHit,
+        splitMeta,
         error: null,
       };
 
       console.log(
-        `Step 2 env=${env} matchedLineCount=${matchedLineCount} streamCount=${filteredStreams.length} limit=${limit}`,
+        `Step 2 env=${env} matchedLineCount=${matchedLineCount} streamCount=${streamCount} limit=${limit} chunks=${splitMeta.chunksQueried} splitDepth=${splitMeta.maxSplitDepthUsed} limitHitLeaves=${splitMeta.limitHitLeafCount}`,
       );
+      appendRunLog("STEP2", "env 404 collection completed", {
+        env,
+        matchedLineCount,
+        streamCount,
+        limit,
+        chunksQueried: splitMeta.chunksQueried,
+        splitCount: splitMeta.splitCount,
+        maxSplitDepthUsed: splitMeta.maxSplitDepthUsed,
+        limitHitLeafCount: splitMeta.limitHitLeafCount,
+        unsplittableLimitHitCount: splitMeta.unsplittableLimitHitCount,
+        metricCountQueryAttempts: splitMeta.metricCountQueryAttempts,
+        metricCountQuerySuccessCount: splitMeta.metricCountQuerySuccessCount,
+        metricCount404EstimateSum: splitMeta.metricCount404EstimateSum,
+        isLimitLikelyHit,
+      });
     } catch (e) {
       byEnv[env] = {
         lokiQuery: expr,
@@ -804,6 +1175,16 @@ async function collectDecision404LogsByEnv(
         streams: [],
         sampleLines: [],
         isLimitLikelyHit: false,
+        splitMeta: {
+          chunksQueried: 0,
+          splitCount: 0,
+          maxSplitDepthUsed: 0,
+          limitHitLeafCount: 0,
+          unsplittableLimitHitCount: 0,
+          metricCountQueryAttempts: 0,
+          metricCountQuerySuccessCount: 0,
+          metricCount404EstimateSum: 0,
+        },
         error: String(e?.message || e),
       };
       console.error(`Step 2 env=${env} failed:`, e);
@@ -919,21 +1300,28 @@ function parseDecision404Record(line, lokiTsNs, env, pod = null) {
   };
 }
 
-function dedupeDecision404Records(records, { bucketNs = 1e9 } = {}) {
+function buildRequestIdentityKey(
+  rec,
+  { includePod = true, includeTimestamp = true, includeMethod = true, includeMessage = true } = {},
+) {
+  if (!rec || typeof rec !== "object") return "";
+  const parts = [String(rec?.env || "")];
+  if (includePod) parts.push(String(rec?.pod || ""));
+  parts.push(String(rec?.traceID || ""));
+  parts.push(String(rec?.url || ""));
+  if (includeTimestamp) parts.push(String(rec?.lokiTsNs || ""));
+  if (includeMethod) parts.push(String(rec?.methodName || ""));
+  if (includeMessage) parts.push(String(rec?.message || ""));
+  return parts.join("|");
+}
+
+function dedupeDecision404Records(records) {
   const deduped = [];
   let collapsedCount = 0;
   const keyToIdx = new Map();
 
   for (const rec of records || []) {
-    const tsNs = Number(rec?.lokiTsNs || 0);
-    const bucket = Number.isFinite(tsNs) && tsNs > 0 ? Math.floor(tsNs / bucketNs) : "na";
-    const key = [
-      String(rec?.env || ""),
-      String(rec?.pod || ""),
-      String(rec?.traceID || ""),
-      String(rec?.url || ""),
-      String(bucket),
-    ].join("|");
+    const key = buildRequestIdentityKey(rec);
 
     if (!keyToIdx.has(key)) {
       keyToIdx.set(key, deduped.length);
@@ -1024,6 +1412,8 @@ function buildStep3_1Validation(parsedByEnv) {
       reasonCounts,
       validRecords,
       invalidSamples: invalidRecords.slice(0, 20),
+      splitMeta: item?.splitMeta || null,
+      step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
     };
 
     console.log(
@@ -1339,6 +1729,8 @@ async function buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, { lookbackHo
       lookbackHours,
       links,
       missSamples: links.filter(x => !x.matched).slice(0, 20),
+      splitMeta: item?.splitMeta || null,
+      step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
     };
 
     console.log(
@@ -1553,7 +1945,8 @@ function completionMatchesStartRound(rec, startNs) {
   const tsNs = Number(rec?.lokiTsNs);
   if (!Number.isFinite(elapsedMs) || !Number.isFinite(tsNs) || !Number.isFinite(startNs)) return false;
   const expectedStartNs = Math.round(tsNs - elapsedMs * 1e6);
-  return expectedStartNs > Number(startNs);
+  const toleranceNs = 1e6; // 1ms tolerance for log timestamp/back-calculation jitter.
+  return expectedStartNs >= Number(startNs) - toleranceNs;
 }
 
 function parseDeploymentListCacheUpdateRecord(line, lokiTsNs) {
@@ -1881,8 +2274,14 @@ function parseDeploymentStateUpdateRecord(line, lokiTsNs) {
 
 async function analyzeStep3_3ForLink(
   link,
-  { errorLimit = 3000, defaultLookbackHours = 1 } = {},
+  {
+    errorLimit = 3000,
+    defaultLookbackHours = 1,
+    queryLokiFn = null,
+    prefetchedTraceErrorSummary = null,
+  } = {},
 ) {
+  const queryLokiForStep = typeof queryLokiFn === "function" ? queryLokiFn : queryLoki;
   const env = link?.request?.env;
   const pod = link?.request?.pod || null;
   const reqTsNs = Number(link?.request?.lokiTsNs);
@@ -1933,7 +2332,7 @@ async function analyzeStep3_3ForLink(
 
   const defaultLookupStartNs = Math.max(0, Math.floor(reqTsNs - defaultLookbackHours * 60 * 60 * 1e9));
   const defaultLookupEndNs = endNs;
-  const defaultJson = await queryLoki(defaultExpr, {
+  const defaultJson = await queryLokiForStep(defaultExpr, {
     startNs: defaultLookupStartNs,
     endNs: defaultLookupEndNs,
     direction: "BACKWARD",
@@ -1977,7 +2376,7 @@ async function analyzeStep3_3ForLink(
   // cache-round logs when request happens minutes after the round started.
   const deploymentListCacheWindowStartNs = Math.max(0, Math.floor(startNs - 60 * 1e9));
   const deploymentListCacheWindowEndNs = Math.floor(reqTsNs + 15 * 1e9);
-  const deploymentListCacheJson = await queryLoki(deploymentListCacheExpr, {
+  const deploymentListCacheJson = await queryLokiForStep(deploymentListCacheExpr, {
     startNs: deploymentListCacheWindowStartNs,
     endNs: deploymentListCacheWindowEndNs,
     direction: "FORWARD",
@@ -2021,7 +2420,7 @@ async function analyzeStep3_3ForLink(
   if (deploymentListCacheCheck?.decision === "target_not_ready") {
     const postStartNs = Math.floor(reqTsNs);
     const postEndNs = Math.floor(reqTsNs + 10 * 60 * 1e9);
-    const postJson = await queryLoki(deploymentListCacheExpr, {
+    const postJson = await queryLokiForStep(deploymentListCacheExpr, {
       startNs: postStartNs,
       endNs: postEndNs,
       direction: "FORWARD",
@@ -2074,42 +2473,58 @@ async function analyzeStep3_3ForLink(
     entriesSample: [],
   };
   if (traceID) {
-    const traceJson = await queryLoki(traceExpr, {
-      startNs: startNs,
-      endNs: Math.floor(reqTsNs + 5 * 1e9),
-      direction: "BACKWARD",
-      limit: 300,
-    });
-    const traceEntries = [];
-    for (const stream of traceJson?.data?.result || []) {
-      for (const [tsNs, line] of stream.values || []) {
-        const parsed = extractJsonObjectFromLogLine(line);
-        if (!parsed || typeof parsed !== "object") continue;
-        traceEntries.push({
-          lokiTsNs: String(tsNs),
-          level: parsed.level ? String(parsed.level) : null,
-          error: parsed.error ? String(parsed.error) : null,
-          message: parsed.message ? String(parsed.message) : null,
-          deploymentID: parsed.deploymentID ? String(parsed.deploymentID) : null,
-          traceID: parsed.traceID ? String(parsed.traceID) : null,
-          timestamp: parsed.timestamp ? String(parsed.timestamp) : null,
-          line: String(line || ""),
-        });
+    if (
+      prefetchedTraceErrorSummary &&
+      typeof prefetchedTraceErrorSummary === "object" &&
+      String(prefetchedTraceErrorSummary.traceID || "") === traceID
+    ) {
+      appendRunLog("STEP3.3", "using prefetched trace error summary from reuse signature lookup", {
+        ...logCtx,
+      });
+      traceErrorSummary = {
+        ...traceErrorSummary,
+        ...prefetchedTraceErrorSummary,
+      };
+    } else {
+      const traceJson = await queryLokiForStep(traceExpr, {
+        startNs: startNs,
+        endNs: Math.floor(reqTsNs + 5 * 1e9),
+        direction: "BACKWARD",
+        limit: 300,
+      });
+      const traceEntries = [];
+      for (const stream of traceJson?.data?.result || []) {
+        for (const [tsNs, line] of stream.values || []) {
+          const parsed = extractJsonObjectFromLogLine(line);
+          if (!parsed || typeof parsed !== "object") continue;
+          traceEntries.push({
+            lokiTsNs: String(tsNs),
+            level: parsed.level ? String(parsed.level) : null,
+            error: parsed.error ? String(parsed.error) : null,
+            message: parsed.message ? String(parsed.message) : null,
+            deploymentID: parsed.deploymentID ? String(parsed.deploymentID) : null,
+            traceID: parsed.traceID ? String(parsed.traceID) : null,
+            timestamp: parsed.timestamp ? String(parsed.timestamp) : null,
+            line: String(line || ""),
+          });
+        }
       }
+      traceEntries.sort((a, b) => Number(a.lokiTsNs) - Number(b.lokiTsNs));
+      const classified = classifyDecision404ErrorByTrace(traceEntries);
+      traceErrorSummary = {
+        ...traceErrorSummary,
+        traceID,
+        category: classified.category,
+        matchedPattern: classified.matchedPattern,
+        matchedEntry: classified.matchedEntry,
+        runtimeServicesCount: Number(classified.runtimeServicesCount || 0),
+        deploymentListCount: Number(classified.deploymentListCount || 0),
+        bothPatternsPresent: Boolean(classified.bothPatternsPresent),
+        runtimeServicesFirstHitTsNs: classified.runtimeServicesFirstHitTsNs || null,
+        deploymentListFirstHitTsNs: classified.deploymentListFirstHitTsNs || null,
+        entriesSample: traceEntries.slice(-30),
+      };
     }
-    traceEntries.sort((a, b) => Number(a.lokiTsNs) - Number(b.lokiTsNs));
-    const classified = classifyDecision404ErrorByTrace(traceEntries);
-    traceErrorSummary = {
-      category: classified.category,
-      matchedPattern: classified.matchedPattern,
-      matchedEntry: classified.matchedEntry,
-      runtimeServicesCount: Number(classified.runtimeServicesCount || 0),
-      deploymentListCount: Number(classified.deploymentListCount || 0),
-      bothPatternsPresent: Boolean(classified.bothPatternsPresent),
-      runtimeServicesFirstHitTsNs: classified.runtimeServicesFirstHitTsNs || null,
-      deploymentListFirstHitTsNs: classified.deploymentListFirstHitTsNs || null,
-      entriesSample: traceEntries.slice(-30),
-    };
     appendRunLog("STEP3.3", "trace error category determined", {
       ...logCtx,
       traceCategory: traceErrorSummary.category,
@@ -2156,7 +2571,7 @@ async function analyzeStep3_3ForLink(
       startNs: String(stateCheckStartNs),
       endNs: String(stateCheckEndNs),
     };
-    const stateJson = await queryLoki(deploymentStateExpr, {
+    const stateJson = await queryLokiForStep(deploymentStateExpr, {
       startNs: stateCheckStartNs,
       endNs: stateCheckEndNs,
       direction: "BACKWARD",
@@ -2246,7 +2661,7 @@ async function analyzeStep3_3ForLink(
     ` != "/live" != "/ready" |~ "${LOG_PATTERNS.runtimeCompletion}"`;
 
   async function collectCompletionRecordsInRange(rangeStartNs, rangeEndNs) {
-    const completionJson = await queryLoki(completionExpr, {
+    const completionJson = await queryLokiForStep(completionExpr, {
       startNs: rangeStartNs,
       endNs: rangeEndNs,
       direction: "BACKWARD",
@@ -2345,17 +2760,29 @@ async function analyzeStep3_3ForLink(
   let completionDistinctUsedTop3 = completionDistinctOriginalTop3;
   if (completionDistinctOriginalTop3.length < 3) {
     completionExtensionUsed = true;
+    const postExtend1Minutes = Math.max(
+      1,
+      Number(ANALYSIS_CONFIG.step3_3CompletionExtend1Minutes || 15),
+    );
+    const postExtend2Minutes = Math.max(
+      postExtend1Minutes,
+      Number(ANALYSIS_CONFIG.step3_3CompletionExtend2Minutes || 30),
+    );
     const postWindow1StartNs = Math.floor(reqTsNs);
-    const postWindow1EndNs = Math.floor(reqTsNs + 10 * 60 * 1e9);
+    const postWindow1EndNs = Math.floor(reqTsNs + postExtend1Minutes * 60 * 1e9);
     completionWindowEndNs = postWindow1EndNs;
-    appendRunLog("STEP3.3", "extending runtime cache completion search to post-request window +10m", {
-      ...logCtx,
-      originalDistinctCount: completionDistinctOriginalTop3.length,
-      originalWindowStartNs: String(startNs),
-      originalWindowEndNs: String(endNs),
-      extendedWindowStartNs: String(postWindow1StartNs),
-      extendedWindowEndNs: String(postWindow1EndNs),
-    });
+    appendRunLog(
+      "STEP3.3",
+      `extending runtime cache completion search to post-request window +${postExtend1Minutes}m`,
+      {
+        ...logCtx,
+        originalDistinctCount: completionDistinctOriginalTop3.length,
+        originalWindowStartNs: String(startNs),
+        originalWindowEndNs: String(endNs),
+        extendedWindowStartNs: String(postWindow1StartNs),
+        extendedWindowEndNs: String(postWindow1EndNs),
+      },
+    );
     const completionCandidatesPost1 = await collectCompletionRecordsInRange(
       postWindow1StartNs,
       postWindow1EndNs,
@@ -2368,14 +2795,18 @@ async function analyzeStep3_3ForLink(
 
     if (distinctCompletionByDeployment(completionRoundMatchedPostUsed).length < 3) {
       const postWindow2StartNs = postWindow1EndNs;
-      const postWindow2EndNs = Math.floor(reqTsNs + 20 * 60 * 1e9);
+      const postWindow2EndNs = Math.floor(reqTsNs + postExtend2Minutes * 60 * 1e9);
       completionWindowEndNs = postWindow2EndNs;
-      appendRunLog("STEP3.3", "post-request +10m window insufficient; extending to +20m", {
-        ...logCtx,
-        priorPostWindowDistinctCount: distinctCompletionByDeployment(completionRoundMatchedPostUsed).length,
-        extendedWindowStartNs: String(postWindow2StartNs),
-        extendedWindowEndNs: String(postWindow2EndNs),
-      });
+      appendRunLog(
+        "STEP3.3",
+        `post-request +${postExtend1Minutes}m window insufficient; extending to +${postExtend2Minutes}m`,
+        {
+          ...logCtx,
+          priorPostWindowDistinctCount: distinctCompletionByDeployment(completionRoundMatchedPostUsed).length,
+          extendedWindowStartNs: String(postWindow2StartNs),
+          extendedWindowEndNs: String(postWindow2EndNs),
+        },
+      );
       const completionCandidatesPost2 = await collectCompletionRecordsInRange(
         postWindow2StartNs,
         postWindow2EndNs,
@@ -2470,7 +2901,7 @@ async function analyzeStep3_3ForLink(
     `${buildDecisionSelector(env, pod)}` +
     ` != "/live" != "/ready"` +
     ` |~ "starting decision server|starting authz decision server"`;
-  const restartJson = await queryLoki(restartExpr, {
+  const restartJson = await queryLokiForStep(restartExpr, {
     startNs,
     endNs,
     direction: "BACKWARD",
@@ -2502,7 +2933,7 @@ async function analyzeStep3_3ForLink(
       completionDistinctExtendCount: completionDistinctUsedTop3.length,
     });
     // Query cache-loading error evidence after success checks, right before restart evidence.
-    const errorJson = await queryLoki(errorExpr, {
+    const errorJson = await queryLokiForStep(errorExpr, {
       startNs,
       endNs,
       direction: "BACKWARD",
@@ -2624,17 +3055,13 @@ async function fetchTraceErrorSignatureForReuse(link) {
   const pod = link?.request?.pod || null;
   const traceID = String(link?.request?.traceID || "").trim();
   const reqTsNs = Number(link?.request?.lokiTsNs);
-  const prepTsNs = Number(link?.previousLog?.lokiTsNs);
   if (!env || !traceID || !Number.isFinite(reqTsNs) || reqTsNs <= 0) return null;
 
   const traceExpr =
     `${buildDecisionSelector(env, pod)}` +
     ` != "/live" != "/ready" |~ "${traceID}"`;
-  const startNs =
-    Number.isFinite(prepTsNs) && prepTsNs > 0 && prepTsNs < reqTsNs
-      ? Math.floor(prepTsNs)
-      : Math.max(0, Math.floor(reqTsNs - 60 * 1e9));
-  const endNs = Math.floor(reqTsNs + 5 * 1e9);
+  const startNs = Math.max(0, Math.floor(reqTsNs - 5 * 1e9));
+  const endNs = Math.floor(reqTsNs + 1e6);
   const traceJson = await queryLoki(traceExpr, {
     startNs,
     endNs,
@@ -2660,85 +3087,247 @@ async function fetchTraceErrorSignatureForReuse(link) {
   const errorEntries = entries.filter(e => String(e?.level || "").toLowerCase() === "error");
   const selected = errorEntries[0] || entries[0] || null;
   const signature = extractErrorSignatureFromTraceEntry(selected);
+  const classified = classifyDecision404ErrorByTrace(entries);
+  const traceErrorSummary = {
+    traceID,
+    category: classified.category,
+    matchedPattern: classified.matchedPattern,
+    matchedEntry: classified.matchedEntry,
+    runtimeServicesCount: Number(classified.runtimeServicesCount || 0),
+    deploymentListCount: Number(classified.deploymentListCount || 0),
+    bothPatternsPresent: Boolean(classified.bothPatternsPresent),
+    runtimeServicesFirstHitTsNs: classified.runtimeServicesFirstHitTsNs || null,
+    deploymentListFirstHitTsNs: classified.deploymentListFirstHitTsNs || null,
+    entriesSample: entries.slice(-30),
+  };
   return {
     signature,
     selectedEntry: selected,
     query: traceExpr,
     window: { startNs: String(startNs), endNs: String(endNs) },
+    traceErrorSummary,
   };
 }
 
 async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
   const byEnv = {};
-  const reuseWindowNs = Math.floor(
-    (Number(ANALYSIS_CONFIG.step3_3ReuseWindowMinutes || 2) || 2) * 60 * 1e9,
-  );
+  const reuseWindowMinutes = Number(ANALYSIS_CONFIG.step3_3ReuseWindowMinutes || 10) || 10;
+  const reuseWindowNs = Math.floor(reuseWindowMinutes * 60 * 1e9);
 
   for (const [env, item] of Object.entries(step3_2ByEnv || {})) {
     const links = item.links || [];
+    const skipTraceLookupForReuse = Boolean(
+      ANALYSIS_CONFIG.step3_3SkipTraceLookupWhenStep2UnsplittableLimitHit !== false &&
+        Number(item?.step2UnsplittableLimitHitCount || 0) > 0,
+    );
     const analyzedLinks = [];
     const conclusionCounts = {};
     const reusableTemplates = [];
+    const reusableTemplatesByUrl = new Map();
+    const signatureCache = new Map();
+    const exactResultCache = new Map();
+    const traceSeenCounts = new Map();
+    const linkIdentitySeenCounts = new Map();
+    appendRunLog("STEP3.3", "reuse lookup mode for env", {
+      env,
+      skipTraceLookupForReuse,
+      step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
+      step2LimitHitLeafCount: Number(item?.splitMeta?.limitHitLeafCount || 0),
+      step2SplitMaxDepthUsed: Number(item?.splitMeta?.maxSplitDepthUsed || 0),
+    });
+
+    function buildLinkExactIdentityKey(link) {
+      const req = link?.request || {};
+      return [
+        String(req?.env || ""),
+        String(req?.pod || ""),
+        String(req?.traceID || ""),
+        String(req?.url || ""),
+        String(req?.lokiTsNs || ""),
+        String(link?.previousLog?.lokiTsNs || ""),
+      ].join("|");
+    }
+
+    function buildLinkSignatureLookupKey(link) {
+      const req = link?.request || {};
+      return [
+        String(req?.env || ""),
+        String(req?.pod || ""),
+        String(req?.traceID || ""),
+        String(req?.lokiTsNs || ""),
+        String(link?.previousLog?.lokiTsNs || ""),
+      ].join("|");
+    }
 
     for (let i = 0; i < links.length; i += 1) {
       const link = links[i];
+      const linkExactIdentityKey = buildLinkExactIdentityKey(link);
       const reqUrl = String(link?.request?.url || "");
       const reqTsNs = Number(link?.request?.lokiTsNs);
+      const reqTraceID = String(link?.request?.traceID || "");
+      const linkSeenCount = (linkIdentitySeenCounts.get(linkExactIdentityKey) || 0) + 1;
+      linkIdentitySeenCounts.set(linkExactIdentityKey, linkSeenCount);
+
+      if (
+        linkExactIdentityKey &&
+        shouldLogRepeatCount(
+          linkSeenCount,
+          Number(ANALYSIS_CONFIG.step3_3RepeatedLinkIdentityWarnThreshold || 2),
+        )
+      ) {
+        appendRunLog("STEP3.3", "warning: repeated link identity observed during iteration", {
+          env,
+          processed: i + 1,
+          total: links.length,
+          traceID: reqTraceID || null,
+          requestUrl: reqUrl || null,
+          requestTsNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
+          repeatedLinkIdentityCount: linkSeenCount,
+          linkExactIdentityKey,
+        });
+      }
+
+      if (reqTraceID) {
+        const traceSeenCount = (traceSeenCounts.get(reqTraceID) || 0) + 1;
+        traceSeenCounts.set(reqTraceID, traceSeenCount);
+        if (
+          shouldLogRepeatCount(
+            traceSeenCount,
+            Number(ANALYSIS_CONFIG.step3_3RepeatedTraceWarnThreshold || 2),
+          )
+        ) {
+          appendRunLog("STEP3.3", "warning: repeated traceID observed during iteration", {
+            env,
+            processed: i + 1,
+            total: links.length,
+            traceID: reqTraceID,
+            requestUrl: reqUrl || null,
+            requestTsNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
+            repeatedTraceCount: traceSeenCount,
+            linkExactIdentityKey,
+          });
+        }
+      }
 
       let result = null;
       let reusedFrom = null;
+      let sigInfoForCurrentLink = null;
 
-      const nearUrlCandidates = reusableTemplates.filter(t => {
+      if (exactResultCache.has(linkExactIdentityKey)) {
+        result = deepClone(exactResultCache.get(linkExactIdentityKey));
+      }
+
+      const nearUrlCandidates = (reusableTemplatesByUrl.get(reqUrl) || []).filter(t => {
         if (!t || t.url !== reqUrl) return false;
         if (!Number.isFinite(reqTsNs) || !Number.isFinite(t.requestTsNs)) return false;
         return Math.abs(reqTsNs - t.requestTsNs) <= reuseWindowNs;
       });
 
-      if (nearUrlCandidates.length > 0) {
-        const sigInfo = await fetchTraceErrorSignatureForReuse(link);
-        const signature = sigInfo?.signature || null;
-        if (signature) {
+      if (!result && nearUrlCandidates.length > 0) {
+        if (skipTraceLookupForReuse) {
           const matchedTemplate =
-            nearUrlCandidates.find(t => t.signature === signature) || null;
+            nearUrlCandidates
+              .slice()
+              .sort(
+                (a, b) =>
+                  Math.abs(Number(a.requestTsNs) - reqTsNs) -
+                  Math.abs(Number(b.requestTsNs) - reqTsNs),
+              )[0] || null;
           if (matchedTemplate) {
             result = deepClone(matchedTemplate.result);
-            result.reason = "reused_within_2m_same_url_same_error";
+            result.reason = "reused_within_10m_same_url_only_due_to_limit_hit";
             result.reuseMeta = {
               reused: true,
               sourceTraceID: matchedTemplate.traceID,
               sourceRequestTsNs: String(matchedTemplate.requestTsNs),
-              sourceSignature: matchedTemplate.signature,
-              currentSignature: signature,
+              sourceSignature: matchedTemplate.signature || null,
+              currentSignature: null,
               windowNs: String(reuseWindowNs),
-              signatureQuery: sigInfo?.query || null,
-              signatureWindow: sigInfo?.window || null,
+              signatureQuery: null,
+              signatureWindow: null,
+              reuseMode: "url_only_due_to_step2_limit_hit",
+              skipTraceLookupForReuse: true,
+              step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
             };
             reusedFrom = matchedTemplate.traceID;
-            appendRunLog("STEP3.3", "reused prior result by url+error signature in 2m window", {
-              env,
-              traceID: String(link?.request?.traceID || ""),
-              requestUrl: reqUrl || null,
-              reusedFromTraceID: matchedTemplate.traceID,
-              signature,
-            });
+            appendRunLog(
+              "STEP3.3",
+              `reused prior result by url-only in ${reuseWindowMinutes}m window (signature lookup skipped due to step2 limit-hit)`,
+              {
+                env,
+                traceID: reqTraceID,
+                requestUrl: reqUrl || null,
+                reusedFromTraceID: matchedTemplate.traceID,
+                skipTraceLookupForReuse: true,
+                step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
+              },
+            );
+          }
+        } else {
+          const sigKey = buildLinkSignatureLookupKey(link);
+          let sigInfo = signatureCache.get(sigKey) || null;
+          if (!sigInfo) {
+            sigInfo = await fetchTraceErrorSignatureForReuse(link);
+            signatureCache.set(sigKey, sigInfo || null);
+          }
+          sigInfoForCurrentLink = sigInfo || null;
+          const signature = sigInfo?.signature || null;
+          if (signature) {
+            const matchedTemplate =
+              nearUrlCandidates.find(t => t.signature === signature) || null;
+            if (matchedTemplate) {
+              result = deepClone(matchedTemplate.result);
+              result.reason = "reused_within_10m_same_url_same_error";
+              result.reuseMeta = {
+                reused: true,
+                sourceTraceID: matchedTemplate.traceID,
+                sourceRequestTsNs: String(matchedTemplate.requestTsNs),
+                sourceSignature: matchedTemplate.signature,
+                currentSignature: signature,
+                windowNs: String(reuseWindowNs),
+                signatureQuery: sigInfo?.query || null,
+                signatureWindow: sigInfo?.window || null,
+              };
+              reusedFrom = matchedTemplate.traceID;
+              appendRunLog(
+                "STEP3.3",
+                `reused prior result by url+error signature in ${reuseWindowMinutes}m window`,
+                {
+                  env,
+                  traceID: reqTraceID,
+                  requestUrl: reqUrl || null,
+                  reusedFromTraceID: matchedTemplate.traceID,
+                  signature,
+                },
+              );
+            }
           }
         }
       }
 
       if (!result) {
-        result = await analyzeStep3_3ForLink(link);
+        result = await analyzeStep3_3ForLink(link, {
+          prefetchedTraceErrorSummary: sigInfoForCurrentLink?.traceErrorSummary || null,
+        });
         const signatureFromResult = extractErrorSignatureFromTraceEntry(
           result?.traceErrorSummary?.matchedEntry,
         );
         if (signatureFromResult && reqUrl && Number.isFinite(reqTsNs)) {
-          reusableTemplates.push({
+          const template = {
             url: reqUrl,
             requestTsNs: reqTsNs,
             signature: signatureFromResult,
             traceID: String(link?.request?.traceID || ""),
             result: deepClone(result),
-          });
+          };
+          reusableTemplates.push(template);
+          if (!reusableTemplatesByUrl.has(reqUrl)) reusableTemplatesByUrl.set(reqUrl, []);
+          reusableTemplatesByUrl.get(reqUrl).push(template);
         }
+      }
+
+      if (result) {
+        exactResultCache.set(linkExactIdentityKey, deepClone(result));
       }
 
       const duplicateCount = Number(link?.request?.duplicateCount || 1);
@@ -3541,19 +4130,32 @@ function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, st
     "cache_not_ready_yet",
     "deployment_not_in_top_3_latest_deployments",
     "runtime_services_cache_load_failure",
+    "root_cause_unknown",
   ];
   const reuseCountByEnv = {};
   for (const [env, item] of Object.entries(step3_3ByEnv || {})) {
     let reuseCount = 0;
     for (const link of item?.links || []) {
-      if (String(link?.reason || "") !== "reused_within_2m_same_url_same_error") continue;
+      const reason = String(link?.reason || "");
+      if (
+        reason !== "reused_within_10m_same_url_same_error" &&
+        reason !== "reused_within_10m_same_url_only_due_to_limit_hit"
+      ) {
+        continue;
+      }
       reuseCount += Number(link?.request?.duplicateCount || 1);
     }
     reuseCountByEnv[env] = reuseCount;
   }
   const byEnv = {};
+  const rootCauseCountsByEnv = {};
   const ensureEnv = env => {
     const key = String(env || "");
+    const step2MatchedLineCount = Number(step2SummaryByEnv?.[key]?.matchedLineCount || 0);
+    const step2EstimatedTotal404 = Number(step2SummaryByEnv?.[key]?.estimatedTotal404 || 0);
+    const step2UnsplittableLimitHitCount = Number(
+      step2SummaryByEnv?.[key]?.unsplittableLimitHitCount || 0,
+    );
     if (!byEnv[key]) {
       const row = {
         env: key,
@@ -3561,11 +4163,14 @@ function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, st
         rootCauseCount: 0,
         reuseRootCauseCourt: Number(reuseCountByEnv?.[key] || 0),
         furtherAnalysisCount: 0,
-        step2MatchedLineCount: Number(step2SummaryByEnv?.[key]?.matchedLineCount || 0),
+        step2MatchedLineCount,
+        step2EstimatedTotal404,
+        step2UnsplittableLimitHitCount,
       };
       for (const col of summaryRootCauseColumns) row[col] = 0;
       byEnv[key] = row;
     }
+    if (!rootCauseCountsByEnv[key]) rootCauseCountsByEnv[key] = new Map();
     return byEnv[key];
   };
 
@@ -3575,6 +4180,10 @@ function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, st
     x.total404 += dup;
     x.rootCauseCount += dup;
     const cause = String(row.rootCause || "");
+    const causeMap = rootCauseCountsByEnv[String(row.env || "")];
+    if (causeMap) {
+      causeMap.set(cause, Number(causeMap.get(cause) || 0) + dup);
+    }
     const summaryCol = rootCauseToSummaryColumn[cause];
     if (summaryCol) {
       x[summaryCol] += dup;
@@ -3585,6 +4194,60 @@ function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, st
     const dup = Number(row?.duplicateCount || 1);
     x.total404 += dup;
     x.furtherAnalysisCount += dup;
+  }
+
+  // For unsplittable limit-hit envs, allocate estimated extra volume to either:
+  // - the single identified root cause category, or
+  // - root_cause_unknown (if multiple/no identified root cause categories).
+  for (const row of Object.values(byEnv)) {
+    const env = String(row?.env || "");
+    const step2MatchedLineCount = Number(row?.step2MatchedLineCount || 0);
+    const estimated = Number(row?.step2EstimatedTotal404 || 0);
+    const unsplittableLimitHitCount = Number(row?.step2UnsplittableLimitHitCount || 0);
+    const extraEstimatedCount =
+      Number.isFinite(estimated) && Number.isFinite(step2MatchedLineCount)
+        ? Math.max(0, estimated - step2MatchedLineCount)
+        : 0;
+
+    if (unsplittableLimitHitCount > 0 && extraEstimatedCount > 0) {
+      const causeMap = rootCauseCountsByEnv[env] || new Map();
+      const identifiedRootCauses = [...causeMap.keys()].filter(Boolean);
+
+      if (identifiedRootCauses.length === 1) {
+        const onlyCause = identifiedRootCauses[0];
+        const summaryCol = rootCauseToSummaryColumn[onlyCause];
+        if (summaryCol) {
+          row[summaryCol] += extraEstimatedCount;
+        } else {
+          row.root_cause_unknown += extraEstimatedCount;
+        }
+        row.rootCauseCount += extraEstimatedCount;
+        row.reuseRootCauseCourt += extraEstimatedCount;
+        row.total404 += extraEstimatedCount;
+        appendRunLog("STEP3.4", "estimated 404 allocated to single identified root cause", {
+          env,
+          identifiedRootCause: onlyCause,
+          step2MatchedLineCount,
+          step2EstimatedTotal404: estimated,
+          extraEstimatedCount,
+          unsplittableLimitHitCount,
+        });
+      } else {
+        row.root_cause_unknown += extraEstimatedCount;
+        row.rootCauseCount += extraEstimatedCount;
+        row.furtherAnalysisCount += extraEstimatedCount;
+        row.total404 += extraEstimatedCount;
+        appendRunLog("STEP3.4", "estimated 404 allocated to root_cause_unknown", {
+          env,
+          identifiedRootCauseCount: identifiedRootCauses.length,
+          identifiedRootCauses,
+          step2MatchedLineCount,
+          step2EstimatedTotal404: estimated,
+          extraEstimatedCount,
+          unsplittableLimitHitCount,
+        });
+      }
+    }
   }
 
   return Object.values(byEnv).sort((a, b) => String(a.env).localeCompare(String(b.env)));
@@ -3611,6 +4274,22 @@ function buildStep3ParsedByEnv(step2ByEnv) {
     }
 
     const dedupeRes = dedupeDecision404Records(records);
+    const traceCounts = new Map();
+    for (const rec of dedupeRes.records || []) {
+      const traceID = String(rec?.traceID || "");
+      if (!traceID) continue;
+      traceCounts.set(traceID, (traceCounts.get(traceID) || 0) + 1);
+    }
+    const repeatedTraceStats = [...traceCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .sort((a, b) => b[1] - a[1]);
+    const repeatedTraceCount = repeatedTraceStats.length;
+    const repeatedTraceRows = repeatedTraceStats.reduce((sum, [, count]) => sum + count, 0);
+    const maxTraceRepeatCount = repeatedTraceStats.length ? repeatedTraceStats[0][1] : 1;
+    const repeatedTraceSamples = repeatedTraceStats
+      .slice(0, 10)
+      .map(([traceID, count]) => ({ traceID, count }));
+
     out[env] = {
       records: dedupeRes.records,
       invalidLineCount,
@@ -3618,6 +4297,8 @@ function buildStep3ParsedByEnv(step2ByEnv) {
       rawRecordCount: records.length,
       dedupedRecordCount: dedupeRes.dedupedRecordCount,
       dedupCollapsedCount: dedupeRes.collapsedCount,
+      splitMeta: item.splitMeta || null,
+      step2UnsplittableLimitHitCount: Number(item?.splitMeta?.unsplittableLimitHitCount || 0),
     };
 
     console.log(
@@ -3630,6 +4311,15 @@ function buildStep3ParsedByEnv(step2ByEnv) {
       dedupCollapsed: dedupeRes.collapsedCount,
       invalidLineCount,
     });
+    appendRunLog("STEP3", "traceID repetition snapshot for env", {
+      env,
+      dedupedRecords: dedupeRes.dedupedRecordCount,
+      uniqueTraceCount: traceCounts.size,
+      repeatedTraceCount,
+      repeatedTraceRows,
+      maxTraceRepeatCount,
+      repeatedTraceSamples,
+    });
   }
 
   return out;
@@ -3638,8 +4328,15 @@ function buildStep3ParsedByEnv(step2ByEnv) {
 function buildStep2CompactSummary(step2ByEnv) {
   const out = {};
   for (const [env, item] of Object.entries(step2ByEnv || {})) {
+    const matchedLineCount = Number(item.matchedLineCount || 0);
+    const metricCount404EstimateSum = Number(item?.splitMeta?.metricCount404EstimateSum || 0);
+    const estimatedTotal404 = Math.max(matchedLineCount, metricCount404EstimateSum);
+    const unsplittableLimitHitCount = Number(item?.splitMeta?.unsplittableLimitHitCount || 0);
     out[env] = {
-      matchedLineCount: item.matchedLineCount || 0,
+      matchedLineCount,
+      estimatedTotal404,
+      metricCount404EstimateSum,
+      unsplittableLimitHitCount,
       streamCount: item.streamCount || 0,
       isLimitLikelyHit: Boolean(item.isLimitLikelyHit),
     };
@@ -3769,87 +4466,103 @@ async function runDecision404AnalysisForRegion(region) {
   };
 }
 
-(async () => {
-  try {
-    appendRunLog("RUN", "Decision404 analysis started");
-    const requestedRegions = ANALYSIS_CONFIG.iterateAllRegions
-      ? ALL_REGIONS
-      : ANALYSIS_CONFIG.regionsToRun;
-    const regions = [...new Set((requestedRegions || []).filter(Boolean))];
-    appendRunLog("RUN", "Region plan determined", {
-      iterateAllRegions: Boolean(ANALYSIS_CONFIG.iterateAllRegions),
-      regionCount: regions.length,
-      regions,
-    });
-
-    const allSummaryRows = [];
-    const allFurtherRows = [];
-    const allImpactedEnvs = new Set();
-    let totalRootCauseCount = 0;
-    let totalFurtherAnalysisCount = 0;
-
-    for (let i = 0; i < regions.length; i += 1) {
-      const region = regions[i];
-      try {
-        const res = await runDecision404AnalysisForRegion(region);
-        totalRootCauseCount += Number(res?.rootCauseCount || 0);
-        totalFurtherAnalysisCount += Number(res?.furtherAnalysisCount || 0);
-        for (const env of res?.impactedEnvs || []) allImpactedEnvs.add(env);
-        allSummaryRows.push(...(res?.summaryRows || []));
-        allFurtherRows.push(...(res?.furtherRows || []));
-      } catch (regionErr) {
-        appendRunLog("RUN", "Region analysis failed; continue with next region", {
-          region,
-          error: String(regionErr?.message || regionErr),
-        });
-        console.error(`Region analysis failed region=${region}:`, regionErr);
-      }
-
-      if (i < regions.length - 1) {
-        const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
-        if (waitMs > 0) await sleepMs(waitMs);
-      }
-    }
-
+if (typeof window !== "undefined") {
+  (async () => {
     try {
-      const saveRes = await saveEnvListTxtFromStep1([...allImpactedEnvs], "EnvList.txt");
-      console.log("Step 1 EnvList.txt export:", saveRes);
+      appendRunLog("RUN", "Decision404 analysis started");
+      const requestedRegions = ANALYSIS_CONFIG.iterateAllRegions
+        ? ALL_REGIONS
+        : ANALYSIS_CONFIG.regionsToRun;
+      const regions = [...new Set((requestedRegions || []).filter(Boolean))];
+      appendRunLog("RUN", "Region plan determined", {
+        iterateAllRegions: Boolean(ANALYSIS_CONFIG.iterateAllRegions),
+        regionCount: regions.length,
+        regions,
+      });
+
+      const allSummaryRows = [];
+      const allFurtherRows = [];
+      const allImpactedEnvs = new Set();
+      let totalRootCauseCount = 0;
+      let totalFurtherAnalysisCount = 0;
+
+      for (let i = 0; i < regions.length; i += 1) {
+        const region = regions[i];
+        try {
+          const res = await runDecision404AnalysisForRegion(region);
+          totalRootCauseCount += Number(res?.rootCauseCount || 0);
+          totalFurtherAnalysisCount += Number(res?.furtherAnalysisCount || 0);
+          for (const env of res?.impactedEnvs || []) allImpactedEnvs.add(env);
+          allSummaryRows.push(...(res?.summaryRows || []));
+          allFurtherRows.push(...(res?.furtherRows || []));
+        } catch (regionErr) {
+          appendRunLog("RUN", "Region analysis failed; continue with next region", {
+            region,
+            error: String(regionErr?.message || regionErr),
+          });
+          console.error(`Region analysis failed region=${region}:`, regionErr);
+        }
+
+        if (i < regions.length - 1) {
+          const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
+          if (waitMs > 0) await sleepMs(waitMs);
+        }
+      }
+
+      try {
+        const saveRes = await saveEnvListTxtFromStep1([...allImpactedEnvs], "EnvList.txt");
+        console.log("Step 1 EnvList.txt export:", saveRes);
+      } catch (e) {
+        console.error("Step 1 EnvList.txt export failed:", e);
+      }
+
+      const runLogContent =
+        [
+          "Decision404 Analysis Run Log",
+          `generatedAtUtc=${new Date().toISOString()}`,
+          `rootCauseCount=${totalRootCauseCount}`,
+          `furtherAnalysisCount=${totalFurtherAnalysisCount}`,
+          `regionCount=${regions.length}`,
+          "",
+          ...RUN_LOG_LINES,
+        ].join("\n") + "\n";
+
+      const csvFiles = [
+        {
+          suggestedName: "decision404_summary_by_env.csv",
+          content: rowsToCsv(allSummaryRows),
+        },
+        {
+          suggestedName: "decision404_further_analysis_table.csv",
+          content: rowsToCsv(allFurtherRows),
+        },
+        {
+          suggestedName: "decision404_analysis_run.log",
+          content: runLogContent,
+        },
+      ];
+      appendRunLog("RUN", "Export panel opened", {
+        files: csvFiles.map(f => f.suggestedName),
+        regionCount: regions.length,
+      });
+      showCsvSavePanel(csvFiles);
     } catch (e) {
-      console.error("Step 1 EnvList.txt export failed:", e);
+      appendRunLog("RUN", "Decision404 analysis failed", { error: String(e?.message || e) });
+      console.error("Decision 404 analysis failed:", e);
     }
+  })();
+}
 
-    const runLogContent =
-      [
-        "Decision404 Analysis Run Log",
-        `generatedAtUtc=${new Date().toISOString()}`,
-        `rootCauseCount=${totalRootCauseCount}`,
-        `furtherAnalysisCount=${totalFurtherAnalysisCount}`,
-        `regionCount=${regions.length}`,
-        "",
-        ...RUN_LOG_LINES,
-      ].join("\n") + "\n";
-
-    const csvFiles = [
-      {
-        suggestedName: "decision404_summary_by_env.csv",
-        content: rowsToCsv(allSummaryRows),
-      },
-      {
-        suggestedName: "decision404_further_analysis_table.csv",
-        content: rowsToCsv(allFurtherRows),
-      },
-      {
-        suggestedName: "decision404_analysis_run.log",
-        content: runLogContent,
-      },
-    ];
-    appendRunLog("RUN", "Export panel opened", {
-      files: csvFiles.map(f => f.suggestedName),
-      regionCount: regions.length,
-    });
-    showCsvSavePanel(csvFiles);
-  } catch (e) {
-    appendRunLog("RUN", "Decision404 analysis failed", { error: String(e?.message || e) });
-    console.error("Decision 404 analysis failed:", e);
-  }
-})();
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    buildRequestIdentityKey,
+    dedupeDecision404Records,
+    parseElapsedTimeMs,
+    isValidDecision404Url,
+    isValidStep3_1Message,
+    validateStep3_1Record,
+    extractRequestedDeploymentFromUrl,
+    analyzeStep3_3ForLink,
+    buildStep3_4DeploymentCacheCheck,
+  };
+}
