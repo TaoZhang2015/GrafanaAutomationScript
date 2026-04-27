@@ -23,8 +23,8 @@ const ANALYSIS_CONFIG = {
   grafanaApiMinIntervalMs: 120,
   grafanaRetryMaxAttempts: 4,
   grafanaRetryBaseDelayMs: 300,
-  step1RangeStartPst: "2026-04-25T00:00:00-00:00",
-  step1RangeEndPst: "2026-04-25T05:59:59-00:00",
+  step1RangeStartPst: "2026-04-26T12:00:00-00:00",
+  step1RangeEndPst: "2026-04-26T23:59:59-00:00",
   step3_3ReuseWindowMinutes: 10,
   step3_3CompletionExtend1Minutes: 15,
   step3_3CompletionExtend2Minutes: 30,
@@ -4258,6 +4258,10 @@ function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, st
     return byEnv[key];
   };
 
+  // Preserve all Step 2/3.3 envs in summary output, even when no root-cause/further rows exist.
+  for (const env of Object.keys(step2SummaryByEnv || {})) ensureEnv(env);
+  for (const env of Object.keys(step3_3ByEnv || {})) ensureEnv(env);
+
   for (const row of step3_4Result?.rootCauseTable || []) {
     const x = ensureEnv(row.env);
     const dup = Number(row?.duplicateCount || 1);
@@ -4648,5 +4652,6 @@ if (typeof module !== "undefined" && module.exports) {
     extractRequestedDeploymentFromUrl,
     analyzeStep3_3ForLink,
     buildStep3_4DeploymentCacheCheck,
+    buildStep3_4SummaryByEnvTable,
   };
 }
