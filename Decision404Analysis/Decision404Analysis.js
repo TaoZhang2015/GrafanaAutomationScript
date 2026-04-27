@@ -23,8 +23,8 @@ const ANALYSIS_CONFIG = {
   grafanaApiMinIntervalMs: 120,
   grafanaRetryMaxAttempts: 4,
   grafanaRetryBaseDelayMs: 300,
-  step1RangeStartPst: "2026-04-25T06:00:00-00:00",
-  step1RangeEndPst: "2026-04-25T11:59:59-00:00",
+  step1RangeStartPst: "2026-04-25T00:00:00-00:00",
+  step1RangeEndPst: "2026-04-25T05:59:59-00:00",
   step3_3ReuseWindowMinutes: 10,
   step3_3CompletionExtend1Minutes: 15,
   step3_3CompletionExtend2Minutes: 30,
@@ -1300,6 +1300,21 @@ function parseDecision404Record(line, lokiTsNs, env, pod = null) {
   };
 }
 
+function deriveDecision404RequestStartTsNs(rec) {
+  const reqEndNs = Number(rec?.lokiTsNs);
+  const elapsedMs = Number(rec?.elapsedTimeMs);
+  if (!Number.isFinite(reqEndNs) || reqEndNs <= 0) return null;
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return null;
+  // Round up duration to the next ms for conservative back-calculation.
+  const elapsedRoundedMs = Math.ceil(elapsedMs);
+  const startNs = Math.floor(reqEndNs - elapsedRoundedMs * 1e6);
+  if (!Number.isFinite(startNs) || startNs <= 0 || startNs > reqEndNs) return null;
+  return {
+    requestStartTsNs: String(startNs),
+    elapsedTimeRoundedMs: elapsedRoundedMs,
+  };
+}
+
 function buildRequestIdentityKey(
   rec,
   { includePod = true, includeTimestamp = true, includeMethod = true, includeMessage = true } = {},
@@ -1665,6 +1680,7 @@ async function buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, { lookbackHo
 
     for (let i = 0; i < requestRecords.length; i += 1) {
       const rec = requestRecords[i];
+      const requestTiming = deriveDecision404RequestStartTsNs(rec);
       const podKey = String(rec?.pod || "__NO_POD__");
       const podPrefetch = podAnchorIndex.get(podKey) || { recordsAsc: [], query: null };
       const latest = pickLatestAnchorAtOrBeforeTs(podPrefetch.recordsAsc, Number(rec?.lokiTsNs));
@@ -1706,6 +1722,10 @@ async function buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, { lookbackHo
           timestamp: rec.timestamp,
           traceID: rec.traceID,
           url: rec.url,
+          elapsedTime: rec.elapsedTime || null,
+          elapsedTimeMs: Number.isFinite(Number(rec.elapsedTimeMs)) ? Number(rec.elapsedTimeMs) : null,
+          elapsedTimeRoundedMs: requestTiming?.elapsedTimeRoundedMs ?? null,
+          requestStartTsNs: requestTiming?.requestStartTsNs ?? null,
           methodName: rec.methodName,
           message: rec.message,
           duplicateCount,
@@ -2285,6 +2305,7 @@ async function analyzeStep3_3ForLink(
   const env = link?.request?.env;
   const pod = link?.request?.pod || null;
   const reqTsNs = Number(link?.request?.lokiTsNs);
+  const reqStartTsNs = Number(link?.request?.requestStartTsNs);
   const prepTsNs = Number(link?.previousLog?.lokiTsNs);
   const reqInfo = extractRequestedDeploymentFromUrl(link?.request?.url);
   const traceID = String(link?.request?.traceID || "").trim();
@@ -2293,6 +2314,8 @@ async function analyzeStep3_3ForLink(
     traceID: traceID || null,
     pod: pod || null,
     requestTsNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
+    requestStartTsNs:
+      Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 ? String(reqStartTsNs) : null,
     requestUrl: link?.request?.url || null,
     requestDeploymentType: reqInfo.type,
     requestDeploymentID: reqInfo.deploymentID || null,
@@ -2487,7 +2510,10 @@ async function analyzeStep3_3ForLink(
       };
     } else {
       const traceJson = await queryLokiForStep(traceExpr, {
-        startNs: startNs,
+        startNs:
+          Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
+            ? Math.floor(reqStartTsNs)
+            : startNs,
         endNs: Math.floor(reqTsNs + 5 * 1e9),
         direction: "BACKWARD",
         limit: 300,
@@ -3055,12 +3081,16 @@ async function fetchTraceErrorSignatureForReuse(link) {
   const pod = link?.request?.pod || null;
   const traceID = String(link?.request?.traceID || "").trim();
   const reqTsNs = Number(link?.request?.lokiTsNs);
+  const reqStartTsNs = Number(link?.request?.requestStartTsNs);
   if (!env || !traceID || !Number.isFinite(reqTsNs) || reqTsNs <= 0) return null;
 
   const traceExpr =
     `${buildDecisionSelector(env, pod)}` +
     ` != "/live" != "/ready" |~ "${traceID}"`;
-  const startNs = Math.max(0, Math.floor(reqTsNs - 5 * 1e9));
+  const startNs =
+    Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
+      ? Math.floor(reqStartTsNs)
+      : Math.max(0, Math.floor(reqTsNs - 5 * 1e9));
   const endNs = Math.floor(reqTsNs + 1e6);
   const traceJson = await queryLoki(traceExpr, {
     startNs,
@@ -3113,8 +3143,11 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
   const byEnv = {};
   const reuseWindowMinutes = Number(ANALYSIS_CONFIG.step3_3ReuseWindowMinutes || 10) || 10;
   const reuseWindowNs = Math.floor(reuseWindowMinutes * 60 * 1e9);
+  const envEntries = Object.entries(step3_2ByEnv || {});
+  const totalEnvCount = envEntries.length;
 
-  for (const [env, item] of Object.entries(step3_2ByEnv || {})) {
+  for (let envIdx = 0; envIdx < envEntries.length; envIdx += 1) {
+    const [env, item] = envEntries[envIdx];
     const links = item.links || [];
     const skipTraceLookupForReuse = Boolean(
       ANALYSIS_CONFIG.step3_3SkipTraceLookupWhenStep2UnsplittableLimitHit !== false &&
@@ -3164,6 +3197,11 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
       const linkExactIdentityKey = buildLinkExactIdentityKey(link);
       const reqUrl = String(link?.request?.url || "");
       const reqTsNs = Number(link?.request?.lokiTsNs);
+      const reqStartTsNs = Number(link?.request?.requestStartTsNs);
+      const reqReuseWindowStartNs =
+        Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
+          ? reqStartTsNs
+          : reqTsNs;
       const reqTraceID = String(link?.request?.traceID || "");
       const linkSeenCount = (linkIdentitySeenCounts.get(linkExactIdentityKey) || 0) + 1;
       linkIdentitySeenCounts.set(linkExactIdentityKey, linkSeenCount);
@@ -3219,8 +3257,15 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
 
       const nearUrlCandidates = (reusableTemplatesByUrl.get(reqUrl) || []).filter(t => {
         if (!t || t.url !== reqUrl) return false;
-        if (!Number.isFinite(reqTsNs) || !Number.isFinite(t.requestTsNs)) return false;
-        return Math.abs(reqTsNs - t.requestTsNs) <= reuseWindowNs;
+        const tReqStartTsNs = Number(t?.requestStartTsNs);
+        const tReuseWindowStartNs =
+          Number.isFinite(tReqStartTsNs) && tReqStartTsNs > 0 && tReqStartTsNs <= Number(t.requestTsNs)
+            ? tReqStartTsNs
+            : Number(t.requestTsNs);
+        if (!Number.isFinite(reqReuseWindowStartNs) || !Number.isFinite(tReuseWindowStartNs)) {
+          return false;
+        }
+        return Math.abs(reqReuseWindowStartNs - tReuseWindowStartNs) <= reuseWindowNs;
       });
 
       if (!result && nearUrlCandidates.length > 0) {
@@ -3230,8 +3275,20 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
               .slice()
               .sort(
                 (a, b) =>
-                  Math.abs(Number(a.requestTsNs) - reqTsNs) -
-                  Math.abs(Number(b.requestTsNs) - reqTsNs),
+                  Math.abs(
+                    (Number.isFinite(Number(a?.requestStartTsNs)) &&
+                    Number(a.requestStartTsNs) > 0 &&
+                    Number(a.requestStartTsNs) <= Number(a.requestTsNs)
+                      ? Number(a.requestStartTsNs)
+                      : Number(a.requestTsNs)) - reqReuseWindowStartNs,
+                  ) -
+                  Math.abs(
+                    (Number.isFinite(Number(b?.requestStartTsNs)) &&
+                    Number(b.requestStartTsNs) > 0 &&
+                    Number(b.requestStartTsNs) <= Number(b.requestTsNs)
+                      ? Number(b.requestStartTsNs)
+                      : Number(b.requestTsNs)) - reqReuseWindowStartNs,
+                  ),
               )[0] || null;
           if (matchedTemplate) {
             result = deepClone(matchedTemplate.result);
@@ -3240,6 +3297,7 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
               reused: true,
               sourceTraceID: matchedTemplate.traceID,
               sourceRequestTsNs: String(matchedTemplate.requestTsNs),
+              sourceRequestStartTsNs: matchedTemplate.requestStartTsNs || null,
               sourceSignature: matchedTemplate.signature || null,
               currentSignature: null,
               windowNs: String(reuseWindowNs),
@@ -3282,6 +3340,7 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
                 reused: true,
                 sourceTraceID: matchedTemplate.traceID,
                 sourceRequestTsNs: String(matchedTemplate.requestTsNs),
+                sourceRequestStartTsNs: matchedTemplate.requestStartTsNs || null,
                 sourceSignature: matchedTemplate.signature,
                 currentSignature: signature,
                 windowNs: String(reuseWindowNs),
@@ -3316,6 +3375,10 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
           const template = {
             url: reqUrl,
             requestTsNs: reqTsNs,
+            requestStartTsNs:
+              Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
+                ? String(reqStartTsNs)
+                : null,
             signature: signatureFromResult,
             traceID: String(link?.request?.traceID || ""),
             result: deepClone(result),
@@ -3407,6 +3470,15 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
       requestRecordCount: weightedRequestCount,
       dedupedRequestRecordCount: links.length,
       conclusionCounts,
+    });
+    const processedEnvCount = envIdx + 1;
+    const progressPct =
+      totalEnvCount > 0 ? Number(((processedEnvCount / totalEnvCount) * 100).toFixed(2)) : 100;
+    appendRunLog("STEP3.3", "env analysis progress", {
+      env,
+      processedEnvCount,
+      totalEnvCount,
+      progressPct,
     });
   }
 
@@ -3529,6 +3601,10 @@ function buildStep3_4DeploymentCacheCheck(
       pod: null,
       requestTimestamp: null,
       requestLokiTsNs: null,
+      requestStartTsNs: null,
+      requestElapsedTime: null,
+      requestElapsedTimeMs: null,
+      requestElapsedTimeRoundedMs: null,
       url: null,
       requestedDeploymentType: null,
       requestedDeploymentID: null,
@@ -3563,6 +3639,14 @@ function buildStep3_4DeploymentCacheCheck(
         pod: request.pod || null,
         requestTimestamp: request.timestamp || null,
         requestLokiTsNs: request.lokiTsNs || null,
+        requestStartTsNs: request.requestStartTsNs || null,
+        requestElapsedTime: request.elapsedTime || null,
+        requestElapsedTimeMs:
+          Number.isFinite(Number(request.elapsedTimeMs)) ? Number(request.elapsedTimeMs) : null,
+        requestElapsedTimeRoundedMs:
+          Number.isFinite(Number(request.elapsedTimeRoundedMs))
+            ? Number(request.elapsedTimeRoundedMs)
+            : null,
         url: request.url || null,
         requestedDeploymentType: reqInfo.type,
         requestedDeploymentID: reqInfo.deploymentID,
