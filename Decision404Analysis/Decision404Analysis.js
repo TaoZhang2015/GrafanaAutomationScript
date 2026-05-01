@@ -19,12 +19,14 @@ const ANALYSIS_CONFIG = {
   activeRegion: "phx",
   iterateAllRegions: true,
   regionsToRun: ["phx"],
+  maxParallelRegions: 4,
+  maxParallelEnvs: 4,
   throttleBetweenRegionsMs: 400,
   grafanaApiMinIntervalMs: 120,
-  grafanaRetryMaxAttempts: 4,
+  grafanaRetryMaxAttempts: 1,
   grafanaRetryBaseDelayMs: 300,
-  step1RangeStartPst: "2026-04-26T12:00:00-00:00",
-  step1RangeEndPst: "2026-04-26T23:59:59-00:00",
+  step1RangeStartPst: "2026-04-27T00:00:00-00:00",
+  step1RangeEndPst: "2026-04-27T23:59:59-00:00",
   step3_3ReuseWindowMinutes: 10,
   step3_3CompletionExtend1Minutes: 15,
   step3_3CompletionExtend2Minutes: 30,
@@ -35,6 +37,8 @@ const ANALYSIS_CONFIG = {
   step3_3SkipTraceLookupWhenStep2UnsplittableLimitHit: true,
   step3_3RepeatedTraceWarnThreshold: 2,
   step3_3RepeatedLinkIdentityWarnThreshold: 2,
+  step3_3FastTimelineEnabled: true,
+  step3_3FastTimelineMinRequestsPerHour: 100,
 };
 
 const ALL_REGIONS = [
@@ -103,7 +107,11 @@ function buildRegionConfig(regionKey) {
 }
 
 let ACTIVE_REGION = ANALYSIS_CONFIG.activeRegion;
-let ACTIVE_REGION_CONFIG = buildRegionConfig(ACTIVE_REGION);
+
+function getMaxParallelEnvs() {
+  const configured = ANALYSIS_CONFIG.maxParallelEnvs ?? ANALYSIS_CONFIG.maxParallelRegions ?? 4;
+  return Math.min(4, Math.max(1, Math.floor(Number(configured) || 4)));
+}
 
 // Support both latest and maintenance-2510 log signatures.
 const LOG_PATTERNS = {
@@ -148,8 +156,88 @@ function formatNsToPst(ns) {
   });
 }
 
+function getConfiguredStepWindowHours() {
+  const startMs = new Date(ANALYSIS_CONFIG.step1RangeStartPst).getTime();
+  const endMs = new Date(ANALYSIS_CONFIG.step1RangeEndPst).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 1;
+  const hours = (endMs - startMs) / (60 * 60 * 1000);
+  if (!Number.isFinite(hours) || hours <= 0) return 1;
+  return hours;
+}
+
 function sleepMs(ms) {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+function resolveRegionContext(regionContext = null) {
+  const region = String(regionContext || ACTIVE_REGION || "").trim();
+  return {
+    region,
+    config: buildRegionConfig(region),
+  };
+}
+
+async function mapWithConcurrency(items, maxConcurrency, worker) {
+  const list = Array.isArray(items) ? items : [];
+  const limit = Math.max(1, Math.floor(Number(maxConcurrency) || 1));
+  const out = new Array(list.length);
+  let nextIdx = 0;
+
+  async function runWorker() {
+    while (true) {
+      const idx = nextIdx;
+      if (idx >= list.length) return;
+      nextIdx += 1;
+      try {
+        out[idx] = { status: "fulfilled", value: await worker(list[idx], idx) };
+      } catch (e) {
+        out[idx] = { status: "rejected", reason: e };
+      }
+    }
+  }
+
+  const workerCount = Math.min(limit, list.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return out;
+}
+
+function createEnvProgressTracker() {
+  const regionEnvCount = new Map();
+  let totalEnvCount = 0;
+  let processedEnvCount = 0;
+
+  function toInt(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.floor(n));
+  }
+
+  function calcProgress() {
+    return {
+      processedEnvCount,
+      totalEnvCount,
+      progressPct: totalEnvCount > 0 ? Number(((processedEnvCount / totalEnvCount) * 100).toFixed(2)) : 100,
+    };
+  }
+
+  return {
+    registerRegion(region, envCount) {
+      const key = String(region || "");
+      const next = toInt(envCount);
+      const prev = regionEnvCount.get(key) || 0;
+      if (next === prev) return calcProgress();
+      regionEnvCount.set(key, next);
+      totalEnvCount += next - prev;
+      return calcProgress();
+    },
+    markEnvProcessed() {
+      processedEnvCount += 1;
+      return calcProgress();
+    },
+    getProgress() {
+      return calcProgress();
+    },
+  };
 }
 
 function shouldLogRepeatCount(count, threshold = 2) {
@@ -174,6 +262,11 @@ function shouldRetryGrafanaStatus(statusCode) {
   return n === 429 || (n >= 500 && n <= 599);
 }
 
+function isFailedToFetchError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return msg.includes("failed to fetch");
+}
+
 function shouldSplitOnGatewayStatus(statusCode) {
   const n = Number(statusCode);
   return n === 502 || n === 504;
@@ -181,10 +274,10 @@ function shouldSplitOnGatewayStatus(statusCode) {
 
 async function queryMimirRange(
   expr,
-  { hours = 24, stepSec = 300, startSec = null, endSec = null } = {},
+  { hours = 24, stepSec = 300, startSec = null, endSec = null, regionContext = null } = {},
 ) {
-  const mimirUid = ACTIVE_REGION_CONFIG.mimirUid;
-  const region = ACTIVE_REGION;
+  const { region, config } = resolveRegionContext(regionContext);
+  const mimirUid = config.mimirUid;
   const actualEndSec = endSec ?? Math.floor(Date.now() / 1000);
   const actualStartSec = startSec ?? actualEndSec - hours * 60 * 60;
   const maxAttempts = Math.max(1, Number(ANALYSIS_CONFIG.grafanaRetryMaxAttempts || 1));
@@ -227,13 +320,14 @@ async function queryMimirRange(
         }
         return await resp.json();
       } catch (e) {
-        if (attempt < maxAttempts - 1) {
+        const retryLimit = isFailedToFetchError(e) ? maxAttempts : 1;
+        if (attempt < retryLimit - 1) {
           const delay = baseDelayMs * Math.pow(2, attempt);
           appendRunLog("MIMIR", "retrying query_range after exception", {
             region,
             path,
             attempt: attempt + 1,
-            maxAttempts,
+            maxAttempts: retryLimit,
             delayMs: delay,
             error: String(e?.message || e),
           });
@@ -241,6 +335,7 @@ async function queryMimirRange(
           continue;
         }
         lastErr = e;
+        break;
       }
     }
   }
@@ -250,7 +345,7 @@ async function queryMimirRange(
 
 async function queryLokiRange(
   expr,
-  { hours = 24, limit = 3000, startNs = null, endNs = null } = {},
+  { hours = 24, limit = 3000, startNs = null, endNs = null, regionContext = null } = {},
 ) {
   const actualEndNs = endNs ?? Date.now() * 1e6;
   const actualStartNs = startNs ?? actualEndNs - hours * 60 * 60 * 1e9;
@@ -259,28 +354,60 @@ async function queryLokiRange(
     endNs: Math.floor(actualEndNs),
     direction: "BACKWARD",
     limit,
+    regionContext,
   });
+}
+
+function normalizeLokiRangeWindowNs(
+  startNs,
+  endNs,
+  { minIntervalNs = 1e9, edgeGraceNs = 1e6 } = {},
+) {
+  let s = Number(startNs);
+  let e = Number(endNs);
+  if (!Number.isFinite(s)) s = Date.now() * 1e6 - minIntervalNs;
+  if (!Number.isFinite(e)) e = s + minIntervalNs;
+  s = Math.floor(s);
+  e = Math.floor(e);
+  const graceNs = Math.max(0, Math.floor(Number(edgeGraceNs) || 1e6));
+  if (graceNs > 0) {
+    s = Math.max(0, s - graceNs);
+    e = e + graceNs;
+  }
+  const minNs = Math.max(1, Math.floor(Number(minIntervalNs) || 1e9));
+  if (e < s) {
+    const tmp = s;
+    s = e;
+    e = tmp;
+  }
+  if (e - s < minNs) {
+    e = s + minNs;
+  }
+  return { startNs: s, endNs: e };
 }
 
 async function queryLoki(
   expr,
-  { startNs, endNs, direction = "BACKWARD", limit = 3000 } = {},
+  { startNs, endNs, direction = "BACKWARD", limit = 3000, regionContext = null } = {},
 ) {
+  const normalizedWindow = normalizeLokiRangeWindowNs(startNs, endNs, { minIntervalNs: 1e9 });
+  const normalizedStartNs = normalizedWindow.startNs;
+  const normalizedEndNs = normalizedWindow.endNs;
   const queryId = ++LOKI_QUERY_SEQ;
-  const region = ACTIVE_REGION;
+  const { region, config } = resolveRegionContext(regionContext);
   appendRunLog("LOKI", "query_range start", {
     queryId,
     region,
     direction,
     limit,
-    startNs: String(startNs),
-    endNs: String(endNs),
-    startPst: formatNsToPst(startNs),
-    endPst: formatNsToPst(endNs),
+    startNs: String(normalizedStartNs),
+    endNs: String(normalizedEndNs),
+    startPst: formatNsToPst(normalizedStartNs),
+    endPst: formatNsToPst(normalizedEndNs),
     expr: String(expr || ""),
   });
 
-  const lokiUid = ACTIVE_REGION_CONFIG.lokiUid;
+  const lokiUid = config.lokiUid;
   const MAX_SPLIT_DEPTH = 4; // 4 depth => up to 16 time chunks
   const MIN_SPLIT_WINDOW_NS = 60 * 1e9; // don't split below 1 minute window
   const MAX_ATTEMPTS = Math.max(1, Number(ANALYSIS_CONFIG.grafanaRetryMaxAttempts || 1));
@@ -404,14 +531,15 @@ async function queryLoki(
         }
         return await resp.json();
       } catch (e) {
-        if (attempt < MAX_ATTEMPTS - 1) {
+        const retryLimit = isFailedToFetchError(e) ? MAX_ATTEMPTS : 1;
+        if (attempt < retryLimit - 1) {
           const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
           appendRunLog("LOKI", "query_range retry after exception", {
             queryId,
             region,
             path,
             attempt: attempt + 1,
-            maxAttempts: MAX_ATTEMPTS,
+            maxAttempts: retryLimit,
             delayMs: delay,
             error: String(e?.message || e),
           });
@@ -427,14 +555,14 @@ async function queryLoki(
   let firstErr = null;
   for (const path of candidatePaths) {
     try {
-      const out = await fetchPathWithSplit(path, Number(startNs), Number(endNs), 0);
+      const out = await fetchPathWithSplit(path, normalizedStartNs, normalizedEndNs, 0);
       appendRunLog("LOKI", "query_range success", {
         queryId,
         region,
         path,
         streamCount: Number(out?.data?.result?.length || 0),
-        startPst: formatNsToPst(startNs),
-        endPst: formatNsToPst(endNs),
+        startPst: formatNsToPst(normalizedStartNs),
+        endPst: formatNsToPst(normalizedEndNs),
       });
       return out;
     } catch (e) {
@@ -452,16 +580,16 @@ async function queryLoki(
   appendRunLog("LOKI", "query_range failed", {
     queryId,
     region,
-    startPst: formatNsToPst(startNs),
-    endPst: formatNsToPst(endNs),
+    startPst: formatNsToPst(normalizedStartNs),
+    endPst: formatNsToPst(normalizedEndNs),
     error: String((firstErr || lastErr)?.message || firstErr || lastErr || "unknown"),
   });
   throw firstErr || lastErr || new Error("All Loki endpoints failed");
 }
 
-async function queryLokiInstant(expr, { timeNs } = {}) {
-  const region = ACTIVE_REGION;
-  const lokiUid = ACTIVE_REGION_CONFIG.lokiUid;
+async function queryLokiInstant(expr, { timeNs, regionContext = null } = {}) {
+  const { region, config } = resolveRegionContext(regionContext);
+  const lokiUid = config.lokiUid;
   const MAX_ATTEMPTS = Math.max(1, Number(ANALYSIS_CONFIG.grafanaRetryMaxAttempts || 1));
   const BASE_RETRY_DELAY_MS = Math.max(50, Number(ANALYSIS_CONFIG.grafanaRetryBaseDelayMs || 300));
   const actualTimeNs = Number.isFinite(Number(timeNs)) ? Math.floor(Number(timeNs)) : Date.now() * 1e6;
@@ -523,13 +651,14 @@ async function queryLokiInstant(expr, { timeNs } = {}) {
         });
         return out;
       } catch (e) {
-        if (attempt < MAX_ATTEMPTS - 1) {
+        const retryLimit = isFailedToFetchError(e) ? MAX_ATTEMPTS : 1;
+        if (attempt < retryLimit - 1) {
           const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
           appendRunLog("LOKI", "instant query retry after exception", {
             region,
             path,
             attempt: attempt + 1,
-            maxAttempts: MAX_ATTEMPTS,
+            maxAttempts: retryLimit,
             delayMs: delay,
             error: String(e?.message || e),
           });
@@ -537,11 +666,98 @@ async function queryLokiInstant(expr, { timeNs } = {}) {
           continue;
         }
         lastErr = e;
+        break;
       }
     }
   }
 
   throw lastErr || new Error("All Loki instant-query endpoints failed");
+}
+
+function countLokiResultLines(lokiJson) {
+  let n = 0;
+  for (const stream of lokiJson?.data?.result || []) {
+    n += Number(stream?.values?.length || 0);
+  }
+  return n;
+}
+
+function collectLokiEntriesSortedAsc(lokiJson) {
+  const entries = [];
+  for (const stream of lokiJson?.data?.result || []) {
+    for (const [tsNs, line] of stream.values || []) {
+      const ts = Number(tsNs);
+      if (!Number.isFinite(ts) || ts <= 0) continue;
+      entries.push({
+        lokiTsNs: String(tsNs),
+        tsNsNum: ts,
+        line: String(line || ""),
+      });
+    }
+  }
+  entries.sort((a, b) => a.tsNsNum - b.tsNsNum);
+  return entries;
+}
+
+function mergeLokiEntriesSortedAsc(lhs, rhs) {
+  const out = [...(lhs || []), ...(rhs || [])];
+  out.sort((a, b) => Number(a?.tsNsNum || 0) - Number(b?.tsNsNum || 0));
+  return out;
+}
+
+async function fetchLokiEntriesWithAutoSplitOnLimit(
+  expr,
+  {
+    startNs,
+    endNs,
+    direction = "FORWARD",
+    limit = 3000,
+    regionContext = null,
+    splitMaxDepth = 12,
+    splitMinWindowMinutes = 1,
+    logStep = "LOKI",
+    logContext = {},
+  } = {},
+) {
+  const minWindowNs = Math.max(
+    1,
+    Math.floor((Number(splitMinWindowMinutes || 1) || 1) * 60 * 1e9),
+  );
+
+  async function fetchWindow(sNs, eNs, depth = 0) {
+    const json = await queryLoki(expr, {
+      startNs: sNs,
+      endNs: eNs,
+      direction,
+      limit,
+      regionContext,
+    });
+    const lineCount = countLokiResultLines(json);
+    const windowNs = Math.max(0, Number(eNs) - Number(sNs));
+    const shouldSplit = lineCount >= Number(limit) && depth < splitMaxDepth && windowNs > minWindowNs;
+    if (!shouldSplit) {
+      return collectLokiEntriesSortedAsc(json);
+    }
+    const midNs = Math.floor((Number(sNs) + Number(eNs)) / 2);
+    appendRunLog(logStep, "auto-split timeline query due to limit-hit risk", {
+      ...logContext,
+      depth: depth + 1,
+      limit,
+      lineCount,
+      startNs: String(sNs),
+      endNs: String(eNs),
+      startPst: formatNsToPst(sNs),
+      endPst: formatNsToPst(eNs),
+      midNs: String(midNs),
+      midPst: formatNsToPst(midNs),
+      windowMinutes: Number((windowNs / 60e9).toFixed(3)),
+    });
+    const left = await fetchWindow(sNs, midNs, depth + 1);
+    const right = await fetchWindow(midNs + 1, eNs, depth + 1);
+    return mergeLokiEntriesSortedAsc(left, right);
+  }
+
+  return fetchWindow(Number(startNs), Number(endNs), 0);
 }
 
 function extractNumericMetricValueFromLokiInstantResponse(metricJson) {
@@ -580,6 +796,227 @@ function lineContains404Status(line) {
     if (req === 404 || resp === 404) return true;
   }
   return /"requestHTTPStatusCode"\s*:\s*404|"responseStatusCode"\s*:\s*404/.test(s);
+}
+
+function lineContains200Status(line) {
+  const s = String(line || "");
+  const obj = extractJsonObjectFromLogLine(s);
+  if (obj && typeof obj === "object") {
+    const req = Number(obj.requestHTTPStatusCode);
+    const resp = Number(obj.responseStatusCode);
+    if (req === 200 || resp === 200) return true;
+  }
+  return /"requestHTTPStatusCode"\s*:\s*200|"responseStatusCode"\s*:\s*200/.test(s);
+}
+
+function isLokiVolumeExceededError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes("max entries limit") ||
+    msg.includes("max entries") ||
+    msg.includes("limit per query exceeded") ||
+    (msg.includes("limit") && msg.includes("exceed"))
+  );
+}
+
+async function countDecision200LogsForRecovery(
+  env,
+  { startNs, endNs, regionContext = null, limit = 3000 } = {},
+) {
+  const expr =
+    `${buildDecisionSelector(env, null)}` +
+    ` != "/live" != "/ready"` +
+    ` |~ \`"requestHTTPStatusCode"\\s*:\\s*200|"responseStatusCode"\\s*:\\s*200\``;
+
+  const start = Number(startNs);
+  const end = Number(endNs);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return {
+      count200: 0,
+      usedSecondHalfAutoSplit: false,
+      secondHalfWindowStartNs: null,
+      secondHalfWindowEndNs: null,
+      queryError: null,
+      expr,
+    };
+  }
+
+  try {
+    const json = await queryLoki(expr, {
+      startNs: start,
+      endNs: end,
+      direction: "FORWARD",
+      limit,
+      regionContext,
+    });
+    let count200 = 0;
+    for (const stream of json?.data?.result || []) {
+      for (const [, line] of stream.values || []) {
+        if (lineContains200Status(line)) count200 += 1;
+      }
+    }
+    return {
+      count200,
+      usedSecondHalfAutoSplit: false,
+      secondHalfWindowStartNs: null,
+      secondHalfWindowEndNs: null,
+      queryError: null,
+      expr,
+    };
+  } catch (e) {
+    if (!isLokiVolumeExceededError(e)) throw e;
+    const midNs = Math.floor((start + end) / 2);
+    const secondHalfStartNs = midNs + 1;
+    appendRunLog("STEP3.5", "recovery query hit volume limit; fallback to second-half auto-split", {
+      env,
+      startNs: String(start),
+      endNs: String(end),
+      startPst: formatNsToPst(start),
+      endPst: formatNsToPst(end),
+      secondHalfStartNs: String(secondHalfStartNs),
+      secondHalfStartPst: formatNsToPst(secondHalfStartNs),
+      limit,
+      error: String(e?.message || e),
+    });
+    const entries = await fetchLokiEntriesWithAutoSplitOnLimit(expr, {
+      startNs: secondHalfStartNs,
+      endNs: end,
+      direction: "FORWARD",
+      limit,
+      regionContext,
+      splitMaxDepth: 12,
+      splitMinWindowMinutes: 1,
+      logStep: "STEP3.5",
+      logContext: {
+        env,
+        mode: "second_half_auto_split",
+      },
+    });
+    let count200 = 0;
+    for (const rec of entries || []) {
+      if (lineContains200Status(rec?.line || "")) count200 += 1;
+    }
+    return {
+      count200,
+      usedSecondHalfAutoSplit: true,
+      secondHalfWindowStartNs: String(secondHalfStartNs),
+      secondHalfWindowEndNs: String(end),
+      queryError: String(e?.message || e),
+      expr,
+    };
+  }
+}
+
+async function evaluateRecoveryStatusByEnv(step3ParsedByEnv, { regionContext = null } = {}) {
+  const envs = Object.keys(step3ParsedByEnv || {});
+  const nowNs = Math.floor(Date.now() * 1e6);
+  const recoveredThresholdCount = 100;
+  const recoveredThresholdWindowNs = 12 * 60 * 60 * 1e9;
+  const out = {};
+
+  await mapWithConcurrency(envs, getMaxParallelEnvs(), async env => {
+    const records = step3ParsedByEnv?.[env]?.records || [];
+    let last404TsNs = 0;
+    for (const rec of records) {
+      const ts = Number(rec?.lokiTsNs || 0);
+      if (Number.isFinite(ts) && ts > last404TsNs) last404TsNs = ts;
+    }
+    if (!Number.isFinite(last404TsNs) || last404TsNs <= 0) {
+      out[env] = {
+        recoveryStatus: "not_sure",
+        recoveryReason: "no_404_reference_found",
+        recovery200Count: 0,
+        recoveryWindowStartNs: null,
+        recoveryWindowEndNs: String(nowNs),
+        recoveryWindowHours: 0,
+        recoveryLast404TsNs: null,
+        recoveryUsedSecondHalfAutoSplit: false,
+        recoverySecondHalfWindowStartNs: null,
+        recoverySecondHalfWindowEndNs: null,
+        recoveryQueryError: null,
+      };
+      return;
+    }
+
+    const startNs = Math.floor(last404TsNs + 10 * 1e9);
+    const endNs = nowNs;
+    const intervalNs = Math.max(0, endNs - startNs);
+    const intervalHours = intervalNs / (60 * 60 * 1e9);
+
+    let countResult = null;
+    try {
+      countResult = await countDecision200LogsForRecovery(env, {
+        startNs,
+        endNs,
+        regionContext,
+        limit: 3000,
+      });
+    } catch (e) {
+      out[env] = {
+        recoveryStatus: "not_sure",
+        recoveryReason: "recovery_query_failed",
+        recovery200Count: 0,
+        recoveryWindowStartNs: String(startNs),
+        recoveryWindowEndNs: String(endNs),
+        recoveryWindowHours: Number(intervalHours.toFixed(3)),
+        recoveryLast404TsNs: String(last404TsNs),
+        recoveryUsedSecondHalfAutoSplit: false,
+        recoverySecondHalfWindowStartNs: null,
+        recoverySecondHalfWindowEndNs: null,
+        recoveryQueryError: String(e?.message || e),
+      };
+      appendRunLog("STEP3.5", "recovery check failed for env", {
+        env,
+        startNs: String(startNs),
+        endNs: String(endNs),
+        error: String(e?.message || e),
+      });
+      return;
+    }
+
+    const count200 = Number(countResult?.count200 || 0);
+    let recoveryStatus = "not_sure";
+    let recoveryReason = "insufficient_evidence";
+    if (count200 === 0) {
+      recoveryStatus = "not_recovered";
+      recoveryReason = "no_http_200_after_last_404_plus_10s";
+    } else if (count200 > recoveredThresholdCount && intervalNs > recoveredThresholdWindowNs) {
+      recoveryStatus = "recovered";
+      recoveryReason = "http_200_count_gt_100_and_window_gt_12h";
+    }
+
+    out[env] = {
+      recoveryStatus,
+      recoveryReason,
+      recovery200Count: count200,
+      recoveryWindowStartNs: String(startNs),
+      recoveryWindowEndNs: String(endNs),
+      recoveryWindowHours: Number(intervalHours.toFixed(3)),
+      recoveryLast404TsNs: String(last404TsNs),
+      recoveryUsedSecondHalfAutoSplit: Boolean(countResult?.usedSecondHalfAutoSplit),
+      recoverySecondHalfWindowStartNs: countResult?.secondHalfWindowStartNs || null,
+      recoverySecondHalfWindowEndNs: countResult?.secondHalfWindowEndNs || null,
+      recoveryQueryError: countResult?.queryError || null,
+    };
+    appendRunLog("STEP3.5", "env recovery status evaluated", {
+      env,
+      isRecovered: recoveryStatus === "recovered",
+      recoveryStatus,
+      recoveryReason,
+      recovery200Count: count200,
+      recoveryWindowStartNs: String(startNs),
+      recoveryWindowEndNs: String(endNs),
+      recoveryWindowHours: Number(intervalHours.toFixed(3)),
+      recoveryLast404TsNs: String(last404TsNs),
+      recoveryUsedSecondHalfAutoSplit: Boolean(countResult?.usedSecondHalfAutoSplit),
+      recoverySecondHalfWindowStartNs: countResult?.secondHalfWindowStartNs || null,
+      recoverySecondHalfWindowEndNs: countResult?.secondHalfWindowEndNs || null,
+      recoveryQueryError: countResult?.queryError || null,
+    });
+  });
+
+  return out;
 }
 
 function buildDecisionSelector(env, pod) {
@@ -674,7 +1111,7 @@ function mergeDecision404ChunkResults(lhs, rhs, sampleCap = 20) {
 async function collectDecision404LogsForEnvWithAutoSplit(
   env,
   expr,
-  { hours = 24, limit = 3000, startNs = null, endNs = null } = {},
+  { hours = 24, limit = 3000, startNs = null, endNs = null, regionContext = null } = {},
 ) {
   const actualEndNs = endNs ?? Date.now() * 1e6;
   const actualStartNs = startNs ?? actualEndNs - hours * 60 * 60 * 1e9;
@@ -687,7 +1124,13 @@ async function collectDecision404LogsForEnvWithAutoSplit(
   const metricCountEnabled = ANALYSIS_CONFIG.step2RunMetricCountOnUnsplittableLimitHit !== false;
 
   async function fetchWindow(sNs, eNs, depth = 0) {
-    const lokiJson = await queryLokiRange(expr, { hours, limit, startNs: sNs, endNs: eNs });
+    const lokiJson = await queryLokiRange(expr, {
+      hours,
+      limit,
+      startNs: sNs,
+      endNs: eNs,
+      regionContext,
+    });
     const filtered = filterDecision404StreamsFromLoki(lokiJson?.data?.result || [], { limit });
     const windowNs = Math.max(0, Number(eNs) - Number(sNs));
     const canSplit = depth < maxSplitDepth && windowNs > minSplitWindowNs;
@@ -743,7 +1186,7 @@ async function collectDecision404LogsForEnvWithAutoSplit(
         const windowSeconds = Math.max(1, Math.ceil(windowNs / 1e9));
         const metricExpr = `sum(count_over_time(${expr} [${windowSeconds}s]))`;
         try {
-          const metricJson = await queryLokiInstant(metricExpr, { timeNs: eNs });
+          const metricJson = await queryLokiInstant(metricExpr, { timeNs: eNs, regionContext });
           const n = extractNumericMetricValueFromLokiInstantResponse(metricJson);
           if (Number.isFinite(n)) {
             metricCount404Estimate = n;
@@ -1105,15 +1548,16 @@ function showCsvSavePanel(files) {
 
 async function collectDecision404LogsByEnv(
   envList,
-  { hours = 24, limit = 3000, startNs = null, endNs = null } = {},
+  { hours = 24, limit = 3000, startNs = null, endNs = null, regionContext = null } = {},
 ) {
   const byEnv = {};
+  const maxParallelEnvs = getMaxParallelEnvs();
 
-  for (const env of envList) {
+  await mapWithConcurrency(envList, maxParallelEnvs, async env => {
     const expr =
       `${buildDecisionSelector(env, null)}` +
       ` != "/live" != "/ready"` +
-      ` |~ \`"requestHTTPStatusCode":404|"responseStatusCode":404\``;
+      ` |~ \`"requestHTTPStatusCode"\\s*:\\s*404|"responseStatusCode"\\s*:\\s*404\``;
 
     try {
       const splitResult = await collectDecision404LogsForEnvWithAutoSplit(env, expr, {
@@ -1121,6 +1565,7 @@ async function collectDecision404LogsByEnv(
         limit,
         startNs,
         endNs,
+        regionContext,
       });
       const matchedLineCount = Number(splitResult?.matchedLineCount || 0);
       const streamCount = Number(splitResult?.streamCount || 0);
@@ -1189,7 +1634,7 @@ async function collectDecision404LogsByEnv(
       };
       console.error(`Step 2 env=${env} failed:`, e);
     }
-  }
+  });
 
   return byEnv;
 }
@@ -1310,7 +1755,7 @@ function deriveDecision404RequestStartTsNs(rec) {
   const startNs = Math.floor(reqEndNs - elapsedRoundedMs * 1e6);
   if (!Number.isFinite(startNs) || startNs <= 0 || startNs > reqEndNs) return null;
   return {
-    requestStartTsNs: String(startNs),
+    requestStartTimeNs: String(startNs),
     elapsedTimeRoundedMs: elapsedRoundedMs,
   };
 }
@@ -1514,13 +1959,16 @@ function pickLatestLokiLogAtOrBeforeTs(lokiJson, endNs) {
   return best;
 }
 
-async function findLastCachePrepLogBeforeRecord(rec, { lookbackHours = 24 } = {}) {
+async function findLastCachePrepLogBeforeRecord(
+  rec,
+  { lookbackHours = 24, regionContext = null } = {},
+) {
   const recTsNsNum = Number(rec.lokiTsNs);
   if (!Number.isFinite(recTsNsNum) || recTsNsNum <= 0) {
     return { matched: false, reason: "invalid_request_timestamp", previousLog: null };
   }
 
-  const endNs = Math.floor(recTsNsNum - 1);
+  const endNs = subtractNsWithPrecisionGuard(recTsNsNum, 1);
   const startNs = Math.floor(endNs - lookbackHours * 60 * 60 * 1e9);
 
   const expr =
@@ -1533,6 +1981,7 @@ async function findLastCachePrepLogBeforeRecord(rec, { lookbackHours = 24 } = {}
     endNs,
     direction: "BACKWARD",
     limit: 1,
+    regionContext,
   });
 
   const latest = pickLatestLokiLogAtOrBeforeTs(lokiJson, endNs);
@@ -1577,8 +2026,8 @@ function parseCachePrepStartRecord(line, lokiTsNs) {
   };
 }
 
-function pickLatestAnchorAtOrBeforeTs(anchorRecordsSortedAsc, requestTsNs) {
-  const target = Number(requestTsNs);
+function pickLatestAnchorAtOrBeforeTs(anchorRecordsSortedAsc, requestCompleteTimeNs) {
+  const target = Number(requestCompleteTimeNs);
   if (!Number.isFinite(target) || target <= 0) return null;
   const arr = anchorRecordsSortedAsc || [];
   let lo = 0;
@@ -1597,7 +2046,10 @@ function pickLatestAnchorAtOrBeforeTs(anchorRecordsSortedAsc, requestTsNs) {
   return ans >= 0 ? arr[ans] : null;
 }
 
-async function buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, { lookbackHours = 1 } = {}) {
+async function buildStep3_2PreviousLogByEnv(
+  step3_1ValidationByEnv,
+  { lookbackHours = 1, regionContext = null } = {},
+) {
   const byEnv = {};
 
   for (const [env, item] of Object.entries(step3_1ValidationByEnv || {})) {
@@ -1636,7 +2088,7 @@ async function buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, { lookbackHo
         if (v > maxReqNs) maxReqNs = v;
       }
       const startNs = Math.max(0, Math.floor(minReqNs - lookbackHours * 60 * 60 * 1e9));
-      const endNs = Math.floor(maxReqNs - 1);
+      const endNs = subtractNsWithPrecisionGuard(maxReqNs, 1);
       const expr =
         `${buildDecisionSelector(env, pod)}` +
         ` != "/live" != "/ready"` +
@@ -1657,7 +2109,28 @@ async function buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, { lookbackHo
         endNs,
         direction: "FORWARD",
         limit: 3000,
+        regionContext,
       });
+      const anchorPrefetchLineCount = countLokiResultLines(lokiJson);
+      if (anchorPrefetchLineCount >= 3000) {
+        appendRunLog("STEP3.2", "warning: pod anchor prefetch may be truncated due to limit-hit risk", {
+          env,
+          pod: pod || null,
+          limit: 3000,
+          lineCount: anchorPrefetchLineCount,
+          startNs: String(startNs),
+          endNs: String(endNs),
+          startPst: formatNsToPst(startNs),
+          endPst: formatNsToPst(endNs),
+          lookbackHours,
+          expr,
+        });
+        console.warn(
+          `STEP3.2 warning env=${env} pod=${pod || "N/A"}: pod anchor prefetch lineCount>=3000 in ${formatNsToPst(
+            startNs,
+          )} ~ ${formatNsToPst(endNs)}; potential missing anchor entries.`,
+        );
+      }
       const anchors = [];
       for (const stream of lokiJson?.data?.result || []) {
         for (const [tsNs, line] of stream.values || []) {
@@ -1725,7 +2198,7 @@ async function buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, { lookbackHo
           elapsedTime: rec.elapsedTime || null,
           elapsedTimeMs: Number.isFinite(Number(rec.elapsedTimeMs)) ? Number(rec.elapsedTimeMs) : null,
           elapsedTimeRoundedMs: requestTiming?.elapsedTimeRoundedMs ?? null,
-          requestStartTsNs: requestTiming?.requestStartTsNs ?? null,
+          requestStartTimeNs: requestTiming?.requestStartTimeNs ?? null,
           methodName: rec.methodName,
           message: rec.message,
           duplicateCount,
@@ -1811,6 +2284,21 @@ function deepClone(value) {
   }
 }
 
+function subtractNsWithPrecisionGuard(ns, deltaNs = 1) {
+  const n = Number(ns);
+  if (!Number.isFinite(n)) return n;
+  let d = Math.max(1, Math.floor(Number(deltaNs) || 1));
+  let out = n - d;
+  // At nanosecond-scale epoch values (~1e18), JS Number precision is coarse.
+  // Ensure subtraction actually moves the boundary left.
+  if (out === n) {
+    d = Math.max(1024, d);
+    while (d < 1e9 && n - d === n) d *= 2;
+    out = n - d;
+  }
+  return Math.floor(out);
+}
+
 function extractDeploymentIdFromLine(line, parsedObj) {
   const obj = parsedObj || extractJsonObjectFromLogLine(line);
   for (const k of ["deploymentID", "deploymentId", "deployment_id"]) {
@@ -1854,6 +2342,37 @@ function extractErrorRecordFromErrorLine(line) {
     return null;
   }
 
+  if (String(obj?.level || "").toLowerCase() !== "error") return null;
+  if (typeof obj?.error !== "string" || !obj.error.trim()) return null;
+
+  const errorMsg = normalizeWs(obj.error);
+  if (errorMsg.toLowerCase() === "rendering response") return null;
+
+  const ora = errorMsg.match(/\bORA-(\d+)\b/i);
+  if (ora) {
+    const code = ora[1];
+    const oraDisplayMatch = errorMsg.match(
+      /\b(ORA-\d+:\s*[\s\S]*?)(?:\s+for query\s*:?\s*[\s\S]*$|$)/i,
+    );
+    const display = normalizeWs(oraDisplayMatch?.[1] || `ORA-${code}`);
+    return { key: `ORA-${code}`, display };
+  }
+
+  if (obj?.errorCode) {
+    return {
+      key: `CODE-${String(obj.errorCode).trim().toLowerCase()}`,
+      display: errorMsg,
+    };
+  }
+
+  return {
+    key: `MSG-${errorMsg.toLowerCase()}`,
+    display: errorMsg,
+  };
+}
+
+function extractErrorRecordFromParsedLogObject(obj) {
+  if (!obj || typeof obj !== "object") return null;
   if (String(obj?.level || "").toLowerCase() !== "error") return null;
   if (typeof obj?.error !== "string" || !obj.error.trim()) return null;
 
@@ -2292,11 +2811,675 @@ function parseDeploymentStateUpdateRecord(line, lokiTsNs) {
   };
 }
 
+function buildDeploymentStateIndexByDeployment(records) {
+  const byDeployment = new Map();
+  for (const rec of records || []) {
+    const id = String(rec?.deploymentID || "").trim();
+    const ts = Number(rec?.lokiTsNs || 0);
+    if (!id || !Number.isFinite(ts)) continue;
+    if (!byDeployment.has(id)) byDeployment.set(id, []);
+    byDeployment.get(id).push({
+      ...rec,
+      tsNsNum: ts,
+    });
+  }
+  for (const list of byDeployment.values()) {
+    list.sort((a, b) => Number(a?.tsNsNum || 0) - Number(b?.tsNsNum || 0));
+  }
+  return byDeployment;
+}
+
+function findLatestDefaultDeploymentBeforeTs(podTimeline, tsNs) {
+  const targetTs = Number(tsNs);
+  if (!podTimeline || !Number.isFinite(targetTs)) return null;
+  let best = null;
+  for (const rec of podTimeline?.defaultDeploymentEvents || []) {
+    const ts = Number(rec?.lokiTsNs || 0);
+    if (!Number.isFinite(ts) || ts > targetTs) continue;
+    if (!best || ts > Number(best?.lokiTsNs || 0)) best = rec;
+  }
+  if (best) {
+    return {
+      defaultDeploymentID: String(best.deploymentID || ""),
+      lokiTsNs: String(best.lokiTsNs || ""),
+      source: "default_event",
+    };
+  }
+  const rounds = podTimeline?.deploymentListRounds || [];
+  for (const r of rounds) {
+    const endTs = Number(r?.endLokiTsNs || 0);
+    if (!Number.isFinite(endTs) || endTs > targetTs) continue;
+    if (r?.defaultDeploymentID) {
+      return {
+        defaultDeploymentID: String(r.defaultDeploymentID),
+        lokiTsNs: String(r.endLokiTsNs),
+        source: "deployment_list_round",
+      };
+    }
+  }
+  return null;
+}
+
+function findLastCachePrepStartBeforeTs(podTimeline, tsNs) {
+  const targetTs = Number(tsNs);
+  if (!podTimeline || !Number.isFinite(targetTs)) return null;
+  let best = null;
+  for (const rec of podTimeline?.cachePrepStarts || []) {
+    const ts = Number(rec?.lokiTsNs || 0);
+    if (!Number.isFinite(ts) || ts >= targetTs) continue;
+    if (!best || ts > Number(best?.lokiTsNs || 0)) best = rec;
+  }
+  return best;
+}
+
+function distinctCompletionByDeploymentForFast(records) {
+  const byDeployment = new Map();
+  for (const r of records || []) {
+    const id = String(r?.deploymentID || "").trim();
+    if (!id) continue;
+    if (!byDeployment.has(id)) {
+      byDeployment.set(id, {
+        latestLegacySingle: null,
+        latestPolicies: null,
+        latestRoleAssignments: null,
+      });
+    }
+    const slot = byDeployment.get(id);
+    const ts = Number(r?.lokiTsNs || 0);
+    if (!Number.isFinite(ts)) continue;
+    if (r?.completionKind === "legacy_single") {
+      if (!slot.latestLegacySingle || ts > Number(slot.latestLegacySingle?.lokiTsNs || 0)) {
+        slot.latestLegacySingle = r;
+      }
+      continue;
+    }
+    if (r?.completionKind === "new_policies") {
+      if (!slot.latestPolicies || ts > Number(slot.latestPolicies?.lokiTsNs || 0)) {
+        slot.latestPolicies = r;
+      }
+      continue;
+    }
+    if (r?.completionKind === "new_role_assignments") {
+      if (!slot.latestRoleAssignments || ts > Number(slot.latestRoleAssignments?.lokiTsNs || 0)) {
+        slot.latestRoleAssignments = r;
+      }
+    }
+  }
+
+  const out = [];
+  for (const [id, slot] of byDeployment.entries()) {
+    let evidence = null;
+    let completionEvidenceMode = null;
+    if (slot.latestLegacySingle) {
+      evidence = slot.latestLegacySingle;
+      completionEvidenceMode = "legacy_single";
+    } else if (slot.latestPolicies && slot.latestRoleAssignments) {
+      const pTs = Number(slot.latestPolicies.lokiTsNs || 0);
+      const rTs = Number(slot.latestRoleAssignments.lokiTsNs || 0);
+      evidence = pTs >= rTs ? slot.latestPolicies : slot.latestRoleAssignments;
+      completionEvidenceMode = "new_parallel_both_required";
+    }
+    if (!evidence) continue;
+    out.push({
+      deploymentID: id,
+      lokiTsNs: evidence.lokiTsNs,
+      elapsedTime: evidence.elapsedTime || null,
+      elapsedTimeMs: evidence.elapsedTimeMs,
+      timestamp: evidence.timestamp,
+      message: evidence.message || null,
+      completionKind: evidence.completionKind || null,
+      completionEvidenceMode,
+    });
+  }
+  out.sort((a, b) => Number(b?.lokiTsNs || 0) - Number(a?.lokiTsNs || 0));
+  return out;
+}
+
+function evaluateDeploymentStateFromTimeline({
+  managementStateIndexByDeployment,
+  targetDeploymentID,
+  reqTsNs,
+  cacheRoundHitTsNs,
+}) {
+  const servingStates = new Set(["Activated", "Default", "Activating"]);
+  const out = {
+    checked: false,
+    reason: "not_required",
+    targetDeploymentID: targetDeploymentID || null,
+    query: null,
+    window: null,
+    found: false,
+    latest: null,
+    isServingState: null,
+    cacheRoundHitLokiTsNs: Number.isFinite(cacheRoundHitTsNs) ? String(cacheRoundHitTsNs) : null,
+    latestAtOrBeforeCacheHit: null,
+    latestAtOrBeforeCacheHitIsServing: null,
+    servingTransitionAfterCacheHitBeforeRequest: false,
+    servingTransitionEvent: null,
+  };
+  if (!targetDeploymentID || !managementStateIndexByDeployment) return out;
+  const rows = managementStateIndexByDeployment.get(String(targetDeploymentID)) || [];
+  if (!rows.length) {
+    out.checked = true;
+    out.reason = "no_deployment_state_records_in_window";
+    return out;
+  }
+  out.checked = true;
+  out.reason = null;
+  out.found = true;
+  const reqNs = Number(reqTsNs);
+  const latestBeforeReq = [...rows].reverse().find(x => Number(x?.tsNsNum || 0) <= reqNs) || rows[rows.length - 1];
+  out.latest = latestBeforeReq
+    ? {
+        deploymentID: latestBeforeReq.deploymentID,
+        newState: latestBeforeReq.newState || null,
+        curState: latestBeforeReq.curState || null,
+        lokiTsNs: latestBeforeReq.lokiTsNs || null,
+      }
+    : null;
+  out.isServingState = latestBeforeReq ? servingStates.has(String(latestBeforeReq.newState || "")) : null;
+
+  const cacheHitNs = Number(cacheRoundHitTsNs);
+  if (Number.isFinite(cacheHitNs) && cacheHitNs > 0) {
+    const latestAtOrBeforeCacheHit =
+      [...rows].reverse().find(x => Number(x?.tsNsNum || 0) <= cacheHitNs) || null;
+    out.latestAtOrBeforeCacheHit = latestAtOrBeforeCacheHit
+      ? {
+          deploymentID: latestAtOrBeforeCacheHit.deploymentID,
+          newState: latestAtOrBeforeCacheHit.newState || null,
+          curState: latestAtOrBeforeCacheHit.curState || null,
+          lokiTsNs: latestAtOrBeforeCacheHit.lokiTsNs || null,
+        }
+      : null;
+    out.latestAtOrBeforeCacheHitIsServing = latestAtOrBeforeCacheHit
+      ? servingStates.has(String(latestAtOrBeforeCacheHit.newState || ""))
+      : null;
+    const transition = rows.find(x => {
+      const ts = Number(x?.tsNsNum || 0);
+      if (!Number.isFinite(ts)) return false;
+      if (!(ts > cacheHitNs && ts <= reqNs)) return false;
+      const cur = String(x?.curState || "");
+      const next = String(x?.newState || "");
+      return !servingStates.has(cur) && servingStates.has(next);
+    });
+    if (transition) {
+      out.servingTransitionAfterCacheHitBeforeRequest = true;
+      out.servingTransitionEvent = {
+        deploymentID: transition.deploymentID,
+        curState: transition.curState || null,
+        newState: transition.newState || null,
+        lokiTsNs: transition.lokiTsNs || null,
+      };
+    }
+  }
+  return out;
+}
+
+function inferFastTraceCategory({
+  deploymentListCacheCheck,
+  deploymentListPostRequestCheck,
+  completionExtensionUsed,
+  completionDistinctOriginalCount,
+  completionDistinctExtendCount,
+  completionFoundAfterOriginalWindow,
+}) {
+  if (deploymentListCacheCheck?.decision === "target_not_ready") return "deployment_list_not_found";
+  if (
+    completionExtensionUsed &&
+    Number(completionDistinctOriginalCount || 0) < 3 &&
+    Number(completionDistinctExtendCount || 0) >= 3 &&
+    completionFoundAfterOriginalWindow
+  ) {
+    return "runtime_services_not_found";
+  }
+  if (deploymentListPostRequestCheck?.checked && deploymentListPostRequestCheck?.foundInCheckedRounds === false) {
+    return "deployment_list_not_found";
+  }
+  return "unknown";
+}
+
+function buildFastTraceErrorSummary(category) {
+  if (category === "deployment_list_not_found") {
+    return {
+      category,
+      matchedPattern: "related object '%s' of type 'deployment' not found",
+      matchedEntry: null,
+      runtimeServicesCount: 0,
+      deploymentListCount: 1,
+      bothPatternsPresent: false,
+      runtimeServicesFirstHitTsNs: null,
+      deploymentListFirstHitTsNs: null,
+      entriesSample: [],
+    };
+  }
+  if (category === "runtime_services_not_found") {
+    return {
+      category,
+      matchedPattern: "SPDL-2001 Application %s is not found",
+      matchedEntry: null,
+      runtimeServicesCount: 1,
+      deploymentListCount: 0,
+      bothPatternsPresent: false,
+      runtimeServicesFirstHitTsNs: null,
+      deploymentListFirstHitTsNs: null,
+      entriesSample: [],
+    };
+  }
+  return {
+    category: "unknown",
+    matchedPattern: null,
+    matchedEntry: null,
+    runtimeServicesCount: 0,
+    deploymentListCount: 0,
+    bothPatternsPresent: false,
+    runtimeServicesFirstHitTsNs: null,
+    deploymentListFirstHitTsNs: null,
+    entriesSample: [],
+  };
+}
+
+function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
+  const env = link?.request?.env;
+  const pod = link?.request?.pod || null;
+  const reqTsNs = Number(link?.request?.lokiTsNs);
+  if (!env || !pod || !Number.isFinite(reqTsNs) || reqTsNs <= 0) return null;
+  const podTimeline = envTimeline?.podTimelines?.get(String(pod)) || null;
+  if (!podTimeline) return null;
+  const reqInfo = extractRequestedDeploymentFromUrl(link?.request?.url);
+  if (reqInfo.type === "invalid") return null;
+
+  const runtimeCacheStartTimeNs = Number(link?.previousLog?.lokiTsNs || 0);
+  const lastPrep = findLastCachePrepStartBeforeTs(podTimeline, reqTsNs);
+  const startNs = Number.isFinite(runtimeCacheStartTimeNs) && runtimeCacheStartTimeNs > 0 ? runtimeCacheStartTimeNs : Number(lastPrep?.lokiTsNs || 0);
+  if (!Number.isFinite(startNs) || startNs <= 0 || startNs >= reqTsNs) return null;
+  const endNs = subtractNsWithPrecisionGuard(reqTsNs, 1);
+
+  const resolvedDefault = findLatestDefaultDeploymentBeforeTs(podTimeline, endNs);
+  let targetDeploymentID = null;
+  if (reqInfo.type === "explicit") targetDeploymentID = reqInfo.deploymentID;
+  if (reqInfo.type === "default") targetDeploymentID = resolvedDefault?.defaultDeploymentID || null;
+  if (!targetDeploymentID) return null;
+
+  const roundsLatest2 = (podTimeline?.deploymentListRounds || []).slice(0, 2);
+  const deploymentListCacheCheck = evaluateDeploymentListCachePresence({
+    reqInfo,
+    reqTsNs,
+    resolvedDefaultDeploymentID: resolvedDefault?.defaultDeploymentID || null,
+    roundsLatest2,
+  });
+
+  let deploymentListPostRequestCheck = {
+    checked: false,
+    reason: "not_required",
+    targetDeploymentID: targetDeploymentID || null,
+    roundsChecked: 0,
+    foundInCheckedRounds: false,
+    checkedRounds: [],
+    matchedRound: null,
+    window: null,
+  };
+  if (deploymentListCacheCheck?.decision === "target_not_ready") {
+    const postStartNs = Math.floor(reqTsNs);
+    const postEndNs = Math.floor(reqTsNs + 10 * 60 * 1e9);
+    const postRounds = (podTimeline?.deploymentListRoundsChrono || []).filter(
+      r => Number(r?.startLokiTsNs || 0) >= postStartNs && Number(r?.startLokiTsNs || 0) <= postEndNs,
+    );
+    const evaluated = evaluateDeploymentListCacheAfterRequest({
+      reqInfo,
+      reqTsNs,
+      resolvedDefaultDeploymentID: resolvedDefault?.defaultDeploymentID || null,
+      roundsAfterRequest: postRounds,
+      roundsToCheck: 2,
+    });
+    deploymentListPostRequestCheck = {
+      ...evaluated,
+      roundsFound: postRounds.length,
+      window: { startNs: String(postStartNs), endNs: String(postEndNs) },
+    };
+  }
+
+  const completionRecords = podTimeline?.completionRecords || [];
+  const completionCandidatesOriginal = completionRecords.filter(r => {
+    const ts = Number(r?.lokiTsNs || 0);
+    return Number.isFinite(ts) && ts >= startNs && ts <= endNs;
+  });
+  const completionRoundMatchedOriginal = completionCandidatesOriginal.filter(r =>
+    completionMatchesStartRound(r, startNs),
+  );
+  const completionDistinctOriginalAll = distinctCompletionByDeploymentForFast(completionRoundMatchedOriginal);
+  const completionDistinctOriginalTop3 = completionDistinctOriginalAll.slice(0, 3);
+  let completionCandidates = completionCandidatesOriginal;
+  let completionRoundMatched = completionRoundMatchedOriginal;
+  let completionDistinctUsedAll = completionDistinctOriginalAll;
+  let completionDistinctUsedTop3 = completionDistinctOriginalTop3;
+  let completionExtensionUsed = false;
+  let completionWindowEndNs = endNs;
+  if (completionDistinctOriginalTop3.length < 3) {
+    return {
+      fastPathFallbackRequired: true,
+      fallbackReason: "need_previous_round_check_for_insufficient_completion_in_current_round",
+      window: { startNs: String(startNs), endNs: String(endNs) },
+      completionDistinctOriginalCount: completionDistinctOriginalTop3.length,
+    };
+  }
+  const earliestCompletionMatch =
+    completionDistinctUsedAll.find(x => String(x?.deploymentID || "") === String(targetDeploymentID || "")) || null;
+  const completionFoundAfterOriginalWindow = Boolean(
+    earliestCompletionMatch && Number(earliestCompletionMatch.lokiTsNs) > endNs,
+  );
+  const targetInOriginalTop3 = completionDistinctOriginalTop3.some(
+    x => String(x?.deploymentID || "") === String(targetDeploymentID || ""),
+  );
+  const targetInUsedTop3 = completionDistinctUsedTop3.some(
+    x => String(x?.deploymentID || "") === String(targetDeploymentID || ""),
+  );
+
+  const restartEntries = (podTimeline?.restartEntries || []).filter(r => {
+    const ts = Number(r?.lokiTsNs || 0);
+    return Number.isFinite(ts) && ts >= startNs && ts <= endNs;
+  });
+  const timelineFailureRecords = (podTimeline?.failureRecords || []).filter(r => {
+    const ts = Number(r?.lokiTsNs || 0);
+    if (!Number.isFinite(ts) || ts < startNs || ts > endNs) return false;
+    const lineTraceID = String(r?.traceID || "").trim();
+    const requestTraceID = String(link?.request?.traceID || "").trim();
+    if (requestTraceID && lineTraceID && lineTraceID === requestTraceID) return false;
+    return true;
+  });
+  const timelineFailureMap = new Map();
+  for (const r of timelineFailureRecords) {
+    const key = String(r?.key || "").trim();
+    const display = String(r?.display || "").trim();
+    if (!key || !display) continue;
+    if (!timelineFailureMap.has(key) || display.length < String(timelineFailureMap.get(key) || "").length) {
+      timelineFailureMap.set(key, display);
+    }
+  }
+  const timelineUniqueFailureErrors = pruneContainingLongerMessages([...timelineFailureMap.values()]);
+  const restartEvidence = {
+    count: restartEntries.length,
+    entries: restartEntries.slice(0, 20),
+    query: podTimeline?.decisionTimelineExpr || null,
+  };
+
+  let conclusion = null;
+  let reason = null;
+  if (completionDistinctUsedTop3.length >= 3) {
+    if (timelineUniqueFailureErrors.length > 0) {
+      conclusion = "cache_load_failure";
+      reason = "failure_evidence_in_timeline_window";
+    } else {
+      return {
+        fastPathFallbackRequired: true,
+        fallbackReason: "timeline_failure_evidence_missing_for_completed_round",
+        window: { startNs: String(startNs), endNs: String(endNs) },
+        completionDistinctExtendCount: completionDistinctUsedTop3.length,
+        failureEvidenceCount: 0,
+      };
+    }
+  } else if (restartEntries.length >= 1) {
+    conclusion = "cache_load_failure";
+    reason = "restart_warmup";
+  } else {
+    return null;
+  }
+
+  const deploymentStateCheck = evaluateDeploymentStateFromTimeline({
+    managementStateIndexByDeployment: envTimeline?.managementStateIndexByDeployment || null,
+    targetDeploymentID:
+      deploymentListCacheCheck?.targetDeploymentID || targetDeploymentID || null,
+    reqTsNs,
+    cacheRoundHitTsNs: Number(deploymentListCacheCheck?.usedRoundTargetHitLokiTsNs || 0),
+  });
+
+  const inferredTraceCategory = inferFastTraceCategory({
+    deploymentListCacheCheck,
+    deploymentListPostRequestCheck,
+    completionExtensionUsed,
+    completionDistinctOriginalCount: completionDistinctOriginalTop3.length,
+    completionDistinctExtendCount: completionDistinctUsedTop3.length,
+    completionFoundAfterOriginalWindow,
+  });
+  const traceErrorSummary = buildFastTraceErrorSummary(inferredTraceCategory);
+
+  const out = {
+    conclusion,
+    reason,
+    window: { startNs: String(startNs), endNs: String(endNs) },
+    defaultLookupWindow: null,
+    queries: {
+      timelineMode: true,
+      decisionTimelineExpr: podTimeline?.decisionTimelineExpr || null,
+      managementTimelineExpr: envTimeline?.managementTimelineExpr || null,
+    },
+    successfulDeploymentsAll: completionDistinctUsedTop3,
+    successfulDeploymentsLatestTop3: completionDistinctUsedTop3,
+    completionDistinctOriginalCount: completionDistinctOriginalTop3.length,
+    completionDistinctExtendCount: completionDistinctUsedTop3.length,
+    targetInOriginalTop3,
+    targetInUsedTop3,
+    resolvedDefaultDeployment: resolvedDefault
+      ? {
+          defaultDeploymentID: resolvedDefault.defaultDeploymentID || null,
+          lokiTsNs: resolvedDefault.lokiTsNs || null,
+          source: resolvedDefault.source || null,
+        }
+      : null,
+    defaultDeploymentCandidates: [],
+    targetDeploymentID: targetDeploymentID || null,
+    deploymentListCacheWindow: null,
+    deploymentListCacheCandidatesCount: Number(podTimeline?.deploymentListRecords?.length || 0),
+    deploymentListCacheCandidatesSample: (podTimeline?.deploymentListRecords || []).slice(-30),
+    deploymentListCacheRoundsCount: Number(podTimeline?.deploymentListRounds?.length || 0),
+    deploymentListCacheRoundsLatest2: roundsLatest2,
+    deploymentListCacheCheck,
+    deploymentListPostRequestCheck,
+    traceErrorSummary,
+    deploymentStateCheck,
+    completionWindowEndNs: String(completionWindowEndNs),
+    completionExtensionUsed,
+    completionUsedPreviousRound,
+    previousRoundCompletionCheck,
+    completionFoundAfterOriginalWindow,
+    completionCandidatesCount: completionCandidates.length,
+    completionCandidatesSample: completionCandidates.slice(-20),
+    earliestCompletionMatch,
+    completionTiming: {
+      matched: Boolean(earliestCompletionMatch && Number(earliestCompletionMatch.lokiTsNs) > startNs),
+      reason: earliestCompletionMatch ? null : "no_completed_cache_log_for_target_deployment",
+      startLokiTsNs: String(startNs),
+      expectedStartFromCompletionLokiTsNs: null,
+      deltaSec: null,
+      toleranceSec: null,
+    },
+    failureEvidenceCount: timelineUniqueFailureErrors.length,
+    failureEvidence: timelineUniqueFailureErrors.slice(0, 20),
+    uniqueFailureErrors: timelineUniqueFailureErrors,
+    restartEvidence,
+    fastPathTimelineUsed: true,
+  };
+  return out;
+}
+
+async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = {}) {
+  const byEnv = new Map();
+  const decisionTimelinePattern = `${LOG_PATTERNS.cachePrepStart}|${LOG_PATTERNS.runtimeCompletion}|${LOG_PATTERNS.deploymentListAny}|starting decision server|starting authz decision server`;
+
+  for (const [env, item] of Object.entries(step3_2ByEnv || {})) {
+    const links = item?.links || [];
+    if (!links.length) continue;
+    const podToReqTs = new Map();
+    let minReqTs = null;
+    let maxReqTs = null;
+    for (const link of links) {
+      const pod = String(link?.request?.pod || "").trim();
+      const reqTsNs = Number(link?.request?.lokiTsNs);
+      if (!pod || !Number.isFinite(reqTsNs) || reqTsNs <= 0) continue;
+      if (!podToReqTs.has(pod)) podToReqTs.set(pod, []);
+      podToReqTs.get(pod).push(reqTsNs);
+      if (!Number.isFinite(minReqTs) || reqTsNs < minReqTs) minReqTs = reqTsNs;
+      if (!Number.isFinite(maxReqTs) || reqTsNs > maxReqTs) maxReqTs = reqTsNs;
+    }
+    if (!Number.isFinite(minReqTs) || !Number.isFinite(maxReqTs)) continue;
+
+    const podTimelines = new Map();
+    for (const [pod, reqList] of podToReqTs.entries()) {
+      let podMin = reqList[0];
+      let podMax = reqList[0];
+      for (let i = 1; i < reqList.length; i += 1) {
+        if (reqList[i] < podMin) podMin = reqList[i];
+        if (reqList[i] > podMax) podMax = reqList[i];
+      }
+      const startNs = Math.max(0, Math.floor(podMin - 10 * 60 * 1e9));
+      const endNs = Math.floor(podMax + 30 * 60 * 1e9);
+      const decisionTimelineExpr =
+        `${buildDecisionSelector(env, pod)}` +
+        ` != "/live" != "/ready" |~ "${decisionTimelinePattern}"`;
+      const entries = await fetchLokiEntriesWithAutoSplitOnLimit(decisionTimelineExpr, {
+        startNs,
+        endNs,
+        direction: "FORWARD",
+        limit: 3000,
+        regionContext,
+        splitMaxDepth: 12,
+        splitMinWindowMinutes: 1,
+        logStep: "STEP3.TL",
+        logContext: { env, pod, timeline: "decision" },
+      });
+      const cachePrepStarts = [];
+      const completionRecords = [];
+      const deploymentListRecords = [];
+      const defaultDeploymentEvents = [];
+      const restartEntries = [];
+      const failureRecords = [];
+      for (const e of entries) {
+        const parsedObj = extractJsonObjectFromLogLine(e.line);
+        const recStart = parseCachePrepStartRecord(e.line, e.lokiTsNs);
+        if (
+          recStart &&
+          new RegExp(LOG_PATTERNS.cachePrepStart, "i").test(String(recStart?.message || recStart?.line || ""))
+        ) {
+          cachePrepStarts.push(recStart);
+        }
+        const recComp = parseCompletedCachePrepareRecord(e.line, e.lokiTsNs);
+        if (recComp) completionRecords.push(recComp);
+        const recList = parseDeploymentListCacheUpdateRecord(e.line, e.lokiTsNs);
+        if (recList) {
+          deploymentListRecords.push(recList);
+          if (recList.kind === "default") defaultDeploymentEvents.push(recList);
+        }
+        const failureRec = extractErrorRecordFromParsedLogObject(parsedObj);
+        if (failureRec) {
+          failureRecords.push({
+            lokiTsNs: e.lokiTsNs,
+            key: failureRec.key,
+            display: failureRec.display,
+            traceID: String(
+              parsedObj?.traceID ?? parsedObj?.traceId ?? parsedObj?.trace_id ?? "",
+            ).trim() || null,
+            timestamp: parsedObj?.timestamp ? String(parsedObj.timestamp) : null,
+            message: parsedObj?.message ? String(parsedObj.message) : null,
+            error: parsedObj?.error ? String(parsedObj.error) : null,
+            line: e.line,
+          });
+        }
+        const msg = String(parsedObj?.message || e.line || "").toLowerCase();
+        if (
+          msg.includes("starting decision server") ||
+          msg.includes("starting authz decision server")
+        ) {
+          restartEntries.push({
+            lokiTsNs: e.lokiTsNs,
+            timestamp: parsedObj?.timestamp || null,
+            message: parsedObj?.message || null,
+            line: e.line,
+          });
+        }
+      }
+      cachePrepStarts.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+      completionRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+      deploymentListRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+      defaultDeploymentEvents.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+      restartEntries.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+      failureRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+      const deploymentListRounds = buildDeploymentListCacheRounds(deploymentListRecords);
+      const deploymentListRoundsChrono = [...deploymentListRounds].sort(
+        (a, b) => Number(a?.startLokiTsNs || 0) - Number(b?.startLokiTsNs || 0),
+      );
+      podTimelines.set(pod, {
+        pod,
+        startNs,
+        endNs,
+        decisionTimelineExpr,
+        cachePrepStarts,
+        completionRecords,
+        deploymentListRecords,
+        deploymentListRounds,
+        deploymentListRoundsChrono,
+        defaultDeploymentEvents,
+        restartEntries,
+        failureRecords,
+      });
+      appendRunLog("STEP3.TL", "decision timeline built", {
+        env,
+        pod,
+        startNs: String(startNs),
+        endNs: String(endNs),
+        cachePrepStartCount: cachePrepStarts.length,
+        completionCount: completionRecords.length,
+        deploymentListRecordCount: deploymentListRecords.length,
+        deploymentListRoundCount: deploymentListRounds.length,
+        restartCount: restartEntries.length,
+        failureRecordCount: failureRecords.length,
+      });
+    }
+
+    const mgmtStartNs = Math.max(0, Math.floor(minReqTs - 10 * 60 * 1e9));
+    const mgmtEndNs = Math.floor(maxReqTs + 10 * 60 * 1e9);
+    const managementTimelineExpr =
+      `{ container=~"management", namespace="authz", prd_env="${env}" }` +
+      ` != "/live" != "/ready" |~ "update deployment state successfully"`;
+    const mgmtEntries = await fetchLokiEntriesWithAutoSplitOnLimit(managementTimelineExpr, {
+      startNs: mgmtStartNs,
+      endNs: mgmtEndNs,
+      direction: "FORWARD",
+      limit: 3000,
+      regionContext,
+      splitMaxDepth: 12,
+      splitMinWindowMinutes: 1,
+      logStep: "STEP3.TL",
+      logContext: { env, timeline: "management" },
+    });
+    const managementStateRecords = [];
+    for (const e of mgmtEntries) {
+      const rec = parseDeploymentStateUpdateRecord(e.line, e.lokiTsNs);
+      if (!rec) continue;
+      managementStateRecords.push(rec);
+    }
+    managementStateRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+    byEnv.set(env, {
+      env,
+      podTimelines,
+      managementTimelineExpr,
+      managementStateRecords,
+      managementStateIndexByDeployment: buildDeploymentStateIndexByDeployment(managementStateRecords),
+    });
+    appendRunLog("STEP3.TL", "management timeline built", {
+      env,
+      startNs: String(mgmtStartNs),
+      endNs: String(mgmtEndNs),
+      deploymentStateRecordCount: managementStateRecords.length,
+      deploymentStateDeploymentCount: byEnv.get(env).managementStateIndexByDeployment.size,
+    });
+  }
+  return byEnv;
+}
+
 async function analyzeStep3_3ForLink(
   link,
   {
     errorLimit = 3000,
-    defaultLookbackHours = 1,
+    defaultLookbackMinutes = 10,
     queryLokiFn = null,
     prefetchedTraceErrorSummary = null,
   } = {},
@@ -2305,16 +3488,16 @@ async function analyzeStep3_3ForLink(
   const env = link?.request?.env;
   const pod = link?.request?.pod || null;
   const reqTsNs = Number(link?.request?.lokiTsNs);
-  const reqStartTsNs = Number(link?.request?.requestStartTsNs);
-  const prepTsNs = Number(link?.previousLog?.lokiTsNs);
+  const reqStartTsNs = Number(link?.request?.requestStartTimeNs);
+  const runtimeCacheStartTimeNs = Number(link?.previousLog?.lokiTsNs);
   const reqInfo = extractRequestedDeploymentFromUrl(link?.request?.url);
   const traceID = String(link?.request?.traceID || "").trim();
   const logCtx = {
     env,
     traceID: traceID || null,
     pod: pod || null,
-    requestTsNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
-    requestStartTsNs:
+    requestCompleteTimeNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
+    requestStartTimeNs:
       Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 ? String(reqStartTsNs) : null,
     requestUrl: link?.request?.url || null,
     requestDeploymentType: reqInfo.type,
@@ -2332,10 +3515,70 @@ async function analyzeStep3_3ForLink(
       failureEvidence: [],
     };
   }
-  if (!link?.matched || !Number.isFinite(prepTsNs) || prepTsNs <= 0 || prepTsNs >= reqTsNs) {
+  if (!link?.matched || !Number.isFinite(runtimeCacheStartTimeNs) || runtimeCacheStartTimeNs <= 0 || runtimeCacheStartTimeNs >= reqTsNs) {
+    const restartLookbackMinutesNoAnchor = 10;
+    const restartLookbackNsNoAnchor = restartLookbackMinutesNoAnchor * 60 * 1e9;
+    const restartQueryStartNsNoAnchor = Math.max(
+      0,
+      subtractNsWithPrecisionGuard(reqTsNs, restartLookbackNsNoAnchor),
+    );
+    const restartQueryEndNsNoAnchor = subtractNsWithPrecisionGuard(reqTsNs, 1);
+    const restartExprNoAnchor =
+      `${buildDecisionSelector(env, pod)}` +
+      ` != "/live" != "/ready"` +
+      ` |~ "starting decision server|starting authz decision server"`;
+    const restartJsonNoAnchor = await queryLokiForStep(restartExprNoAnchor, {
+      startNs: restartQueryStartNsNoAnchor,
+      endNs: restartQueryEndNsNoAnchor,
+      direction: "BACKWARD",
+      limit: 20,
+    });
+    const restartEntriesNoAnchor = [];
+    for (const stream of restartJsonNoAnchor?.data?.result || []) {
+      for (const [tsNs, line] of stream.values || []) {
+        const parsed = extractJsonObjectFromLogLine(line);
+        restartEntriesNoAnchor.push({
+          lokiTsNs: String(tsNs),
+          timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
+          message: parsed?.message ? String(parsed.message) : null,
+          line: String(line || ""),
+        });
+      }
+    }
+    const restartEvidenceNoAnchor = {
+      count: restartEntriesNoAnchor.length,
+      entries: restartEntriesNoAnchor.slice(0, 20),
+      query: restartExprNoAnchor,
+      startNs: String(restartQueryStartNsNoAnchor),
+      endNs: String(restartQueryEndNsNoAnchor),
+      lookbackNs: String(restartLookbackNsNoAnchor),
+      mode: "request_relative_fallback_no_step3_2_anchor",
+    };
+
+    if (restartEvidenceNoAnchor.count > 0) {
+      appendRunLog("STEP3.3", "missing Step 3.2 anchor; fallback restart evidence found in request-relative window", {
+        ...logCtx,
+        runtimeCacheStartTimeNs: Number.isFinite(runtimeCacheStartTimeNs) ? String(runtimeCacheStartTimeNs) : null,
+        restartEvidenceCount: restartEvidenceNoAnchor.count,
+        restartWindowStartNs: restartEvidenceNoAnchor.startNs,
+        restartWindowEndNs: restartEvidenceNoAnchor.endNs,
+      });
+      return {
+        conclusion: "cache_load_failure",
+        reason: "restart_warmup",
+        successfulDeploymentsAll: [],
+        successfulDeploymentsLatestTop3: [],
+        failureEvidence: [],
+        restartEvidence: restartEvidenceNoAnchor,
+      };
+    }
+
     appendRunLog("STEP3.3", "missing or invalid Step 3.2 anchor, mark cache_load_unknown", {
       ...logCtx,
-      prepTsNs: Number.isFinite(prepTsNs) ? String(prepTsNs) : null,
+      runtimeCacheStartTimeNs: Number.isFinite(runtimeCacheStartTimeNs) ? String(runtimeCacheStartTimeNs) : null,
+      restartEvidenceCount: restartEvidenceNoAnchor.count,
+      restartWindowStartNs: restartEvidenceNoAnchor.startNs,
+      restartWindowEndNs: restartEvidenceNoAnchor.endNs,
     });
     return {
       conclusion: "cache_load_unknown",
@@ -2343,62 +3586,21 @@ async function analyzeStep3_3ForLink(
       successfulDeploymentsAll: [],
       successfulDeploymentsLatestTop3: [],
       failureEvidence: [],
+      restartEvidence: restartEvidenceNoAnchor,
     };
   }
 
-  const startNs = Math.floor(prepTsNs);
-  const endNs = Math.floor(reqTsNs - 1);
-
-  const defaultExpr =
-    `${buildDecisionSelector(env, pod)}` +
-    ` != "/live" != "/ready" |~ "${LOG_PATTERNS.deploymentListDefault}"`;
-
-  const defaultLookupStartNs = Math.max(0, Math.floor(reqTsNs - defaultLookbackHours * 60 * 60 * 1e9));
-  const defaultLookupEndNs = endNs;
-  const defaultJson = await queryLokiForStep(defaultExpr, {
-    startNs: defaultLookupStartNs,
-    endNs: defaultLookupEndNs,
-    direction: "BACKWARD",
-    limit: 3000,
-  });
-
-  const defaultDeploymentCandidates = [];
-  for (const stream of defaultJson?.data?.result || []) {
-    for (const [tsNs, line] of stream.values || []) {
-      const parsed = extractJsonObjectFromLogLine(line);
-      const defaultDeploymentID = extractDefaultDeploymentIdFromLine(line, parsed);
-      if (!defaultDeploymentID) continue;
-      defaultDeploymentCandidates.push({
-        defaultDeploymentID,
-        lokiTsNs: String(tsNs),
-        timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
-        message: parsed?.message ? String(parsed.message) : null,
-        line: String(line || ""),
-      });
-    }
-  }
-  defaultDeploymentCandidates.sort((a, b) => Number(b.lokiTsNs) - Number(a.lokiTsNs));
-  const resolvedDefaultDeployment = defaultDeploymentCandidates[0] || null;
-  appendRunLog("STEP3.3", "default deployment lookup completed", {
-    ...logCtx,
-    defaultCandidatesCount: defaultDeploymentCandidates.length,
-    resolvedDefaultDeploymentID: resolvedDefaultDeployment?.defaultDeploymentID || null,
-    defaultLookupStartNs: String(defaultLookupStartNs),
-    defaultLookupEndNs: String(defaultLookupEndNs),
-  });
-
-  let targetDeploymentID = null;
-  if (reqInfo.type === "explicit") targetDeploymentID = reqInfo.deploymentID;
-  if (reqInfo.type === "default") targetDeploymentID = resolvedDefaultDeployment?.defaultDeploymentID || null;
+  const startNs = Math.floor(runtimeCacheStartTimeNs);
+  const endNs = subtractNsWithPrecisionGuard(reqTsNs, 1);
 
   const deploymentListCacheExpr =
     `${buildDecisionSelector(env, pod)}` +
     ` != "/live" != "/ready"` +
     ` |~ "${LOG_PATTERNS.deploymentListAny}"`;
-  // Anchor this window to Step 3.2 cache-load start to avoid missing the relevant
-  // cache-round logs when request happens minutes after the round started.
-  const deploymentListCacheWindowStartNs = Math.max(0, Math.floor(startNs - 60 * 1e9));
   const deploymentListCacheWindowEndNs = Math.floor(reqTsNs + 15 * 1e9);
+  // Deployment-list cache refresh is independent from runtime-cache prep start.
+  // Keep this search request-relative with a fixed 60s lookback from Step3.3-B end.
+  const deploymentListCacheWindowStartNs = Math.max(0, Math.floor(deploymentListCacheWindowEndNs - 60 * 1e9));
   const deploymentListCacheJson = await queryLokiForStep(deploymentListCacheExpr, {
     startNs: deploymentListCacheWindowStartNs,
     endNs: deploymentListCacheWindowEndNs,
@@ -2413,6 +3615,30 @@ async function analyzeStep3_3ForLink(
       deploymentListCacheCandidates.push(rec);
     }
   }
+  const defaultDeploymentCandidates = deploymentListCacheCandidates
+    .filter(rec => String(rec?.kind || "") === "default" && Number(rec?.lokiTsNs || 0) <= endNs)
+    .map(rec => ({
+      defaultDeploymentID: rec?.deploymentID ? String(rec.deploymentID) : null,
+      lokiTsNs: rec?.lokiTsNs ? String(rec.lokiTsNs) : null,
+      timestamp: rec?.timestamp ? String(rec.timestamp) : null,
+      message: rec?.message ? String(rec.message) : null,
+      line: rec?.line ? String(rec.line) : "",
+    }));
+  defaultDeploymentCandidates.sort((a, b) => Number(b.lokiTsNs) - Number(a.lokiTsNs));
+  const resolvedDefaultDeployment = defaultDeploymentCandidates[0] || null;
+  appendRunLog("STEP3.3", "default deployment lookup completed (from deployment-list cache query)", {
+    ...logCtx,
+    defaultCandidatesCount: defaultDeploymentCandidates.length,
+    resolvedDefaultDeploymentID: resolvedDefaultDeployment?.defaultDeploymentID || null,
+    defaultLookupStartNs: String(deploymentListCacheWindowStartNs),
+    defaultLookupEndNs: String(endNs),
+    defaultLookupSource: "step3_3_deployment_list_cache_query",
+    defaultLookupExcludedPostRequestEntries: true,
+  });
+
+  let targetDeploymentID = null;
+  if (reqInfo.type === "explicit") targetDeploymentID = reqInfo.deploymentID;
+  if (reqInfo.type === "default") targetDeploymentID = resolvedDefaultDeployment?.defaultDeploymentID || null;
   const deploymentListCacheRounds = buildDeploymentListCacheRounds(deploymentListCacheCandidates);
   const deploymentListCacheRoundsLatest2 = deploymentListCacheRounds.slice(0, 2);
   const deploymentListCacheCheck = evaluateDeploymentListCachePresence({
@@ -2421,6 +3647,9 @@ async function analyzeStep3_3ForLink(
     resolvedDefaultDeploymentID: resolvedDefaultDeployment?.defaultDeploymentID || null,
     roundsLatest2: deploymentListCacheRoundsLatest2,
   });
+  const latestRoundDistinctDeploymentCount = new Set(
+    (deploymentListCacheRoundsLatest2?.[0]?.deployments || []).map(x => String(x || "").trim()).filter(Boolean),
+  ).size;
   appendRunLog("STEP3.3", "deployment list cache cross-check evaluated", {
     ...logCtx,
     targetDeploymentID: deploymentListCacheCheck?.targetDeploymentID || targetDeploymentID || null,
@@ -2441,45 +3670,66 @@ async function analyzeStep3_3ForLink(
     window: null,
   };
   if (deploymentListCacheCheck?.decision === "target_not_ready") {
-    const postStartNs = Math.floor(reqTsNs);
-    const postEndNs = Math.floor(reqTsNs + 10 * 60 * 1e9);
-    const postJson = await queryLokiForStep(deploymentListCacheExpr, {
-      startNs: postStartNs,
-      endNs: postEndNs,
-      direction: "FORWARD",
-      limit: 3000,
-    });
-    const postCandidates = [];
-    for (const stream of postJson?.data?.result || []) {
-      for (const [tsNs, line] of stream.values || []) {
-        const rec = parseDeploymentListCacheUpdateRecord(line, tsNs);
-        if (!rec) continue;
-        postCandidates.push(rec);
+    if (latestRoundDistinctDeploymentCount >= 3) {
+      deploymentListPostRequestCheck = {
+        checked: false,
+        reason: "skipped_target_missing_in_last_round_with_3_distinct_deployments",
+        targetDeploymentID: deploymentListCacheCheck?.targetDeploymentID || targetDeploymentID || null,
+        roundsChecked: 0,
+        foundInCheckedRounds: false,
+        checkedRounds: [],
+        matchedRound: null,
+        roundsFound: deploymentListCacheRounds.length,
+        window: null,
+      };
+      appendRunLog("STEP3.3", "deployment list post-request extended check skipped", {
+        ...logCtx,
+        postReason: deploymentListPostRequestCheck.reason,
+        latestRoundDistinctDeploymentCount,
+        deploymentListRoundsCount: deploymentListCacheRounds.length,
+        postTargetDeploymentID: deploymentListPostRequestCheck.targetDeploymentID,
+      });
+    } else {
+      const postStartNs = Math.floor(reqTsNs);
+      const postEndNs = Math.floor(reqTsNs + 10 * 60 * 1e9);
+      const postJson = await queryLokiForStep(deploymentListCacheExpr, {
+        startNs: postStartNs,
+        endNs: postEndNs,
+        direction: "FORWARD",
+        limit: 3000,
+      });
+      const postCandidates = [];
+      for (const stream of postJson?.data?.result || []) {
+        for (const [tsNs, line] of stream.values || []) {
+          const rec = parseDeploymentListCacheUpdateRecord(line, tsNs);
+          if (!rec) continue;
+          postCandidates.push(rec);
+        }
       }
+      const postRounds = buildDeploymentListCacheRounds(postCandidates);
+      const evaluated = evaluateDeploymentListCacheAfterRequest({
+        reqInfo,
+        reqTsNs,
+        resolvedDefaultDeploymentID: resolvedDefaultDeployment?.defaultDeploymentID || null,
+        roundsAfterRequest: postRounds,
+        roundsToCheck: 2,
+      });
+      deploymentListPostRequestCheck = {
+        ...evaluated,
+        window: { startNs: String(postStartNs), endNs: String(postEndNs) },
+        roundsFound: postRounds.length,
+      };
+      appendRunLog("STEP3.3", "deployment list post-request extended check evaluated", {
+        ...logCtx,
+        windowStartNs: String(postStartNs),
+        windowEndNs: String(postEndNs),
+        roundsFound: deploymentListPostRequestCheck.roundsFound,
+        roundsChecked: deploymentListPostRequestCheck.roundsChecked,
+        foundInCheckedRounds: deploymentListPostRequestCheck.foundInCheckedRounds,
+        postReason: deploymentListPostRequestCheck.reason,
+        postTargetDeploymentID: deploymentListPostRequestCheck.targetDeploymentID,
+      });
     }
-    const postRounds = buildDeploymentListCacheRounds(postCandidates);
-    const evaluated = evaluateDeploymentListCacheAfterRequest({
-      reqInfo,
-      reqTsNs,
-      resolvedDefaultDeploymentID: resolvedDefaultDeployment?.defaultDeploymentID || null,
-      roundsAfterRequest: postRounds,
-      roundsToCheck: 2,
-    });
-    deploymentListPostRequestCheck = {
-      ...evaluated,
-      window: { startNs: String(postStartNs), endNs: String(postEndNs) },
-      roundsFound: postRounds.length,
-    };
-    appendRunLog("STEP3.3", "deployment list post-request extended check evaluated", {
-      ...logCtx,
-      windowStartNs: String(postStartNs),
-      windowEndNs: String(postEndNs),
-      roundsFound: deploymentListPostRequestCheck.roundsFound,
-      roundsChecked: deploymentListPostRequestCheck.roundsChecked,
-      foundInCheckedRounds: deploymentListPostRequestCheck.foundInCheckedRounds,
-      postReason: deploymentListPostRequestCheck.reason,
-      postTargetDeploymentID: deploymentListPostRequestCheck.targetDeploymentID,
-    });
   }
   const traceExpr =
     `${buildDecisionSelector(env, pod)}` +
@@ -2509,12 +3759,14 @@ async function analyzeStep3_3ForLink(
         ...prefetchedTraceErrorSummary,
       };
     } else {
+      const traceWindowStartNs =
+        Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
+          ? Math.floor(reqStartTsNs)
+          : Math.floor(reqTsNs);
+      const traceWindowEndNs = Math.floor(reqTsNs);
       const traceJson = await queryLokiForStep(traceExpr, {
-        startNs:
-          Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
-            ? Math.floor(reqStartTsNs)
-            : startNs,
-        endNs: Math.floor(reqTsNs + 5 * 1e9),
+        startNs: traceWindowStartNs,
+        endNs: traceWindowEndNs,
         direction: "BACKWARD",
         limit: 300,
       });
@@ -2773,6 +4025,17 @@ async function analyzeStep3_3ForLink(
 
   let completionWindowEndNs = endNs;
   let completionExtensionUsed = false;
+  let completionUsedPreviousRound = false;
+  const previousRoundCompletionCheck = {
+    checked: false,
+    reason: "not_required",
+    previousRoundStartNs: null,
+    previousRoundEndNs: null,
+    previousRoundDistinctCount: 0,
+    previousRoundContainsTarget: false,
+    usedAsCompletionEvidence: false,
+    error: null,
+  };
   const completionCandidatesOriginal = await collectCompletionRecordsInRange(startNs, endNs);
   const completionRoundMatchedOriginal = completionCandidatesOriginal.filter(r =>
     completionMatchesStartRound(r, startNs),
@@ -2784,12 +4047,135 @@ async function analyzeStep3_3ForLink(
   let completionRoundMatched = completionRoundMatchedOriginal;
   let completionDistinctUsedAll = completionDistinctOriginalAll;
   let completionDistinctUsedTop3 = completionDistinctOriginalTop3;
+  let shouldRunPostRequestExtension = false;
   if (completionDistinctOriginalTop3.length < 3) {
+    previousRoundCompletionCheck.checked = true;
+    const previousRoundLookupEndNs = subtractNsWithPrecisionGuard(startNs, 1);
+    if (!(Number.isFinite(previousRoundLookupEndNs) && previousRoundLookupEndNs > 0)) {
+      previousRoundCompletionCheck.reason = "invalid_previous_round_lookup_window";
+      appendRunLog("STEP3.3", "warning: previous round lookup skipped due to invalid window", {
+        ...logCtx,
+        startNs: String(startNs),
+        previousRoundLookupEndNs: String(previousRoundLookupEndNs),
+      });
+    } else {
+      const previousRoundLookupStartNs = Math.max(0, Math.floor(previousRoundLookupEndNs - 60 * 60 * 1e9));
+      const previousRoundAnchorExpr =
+        `${buildDecisionSelector(env, pod)}` +
+        ` != "/live" != "/ready"` +
+        ` |~ "${LOG_PATTERNS.cachePrepStart}"`;
+      try {
+        const previousRoundAnchorJson = await queryLokiForStep(previousRoundAnchorExpr, {
+          startNs: previousRoundLookupStartNs,
+          endNs: previousRoundLookupEndNs,
+          direction: "BACKWARD",
+          limit: 20,
+        });
+        const previousRoundAnchor = pickLatestLokiLogAtOrBeforeTs(
+          previousRoundAnchorJson,
+          previousRoundLookupEndNs,
+        );
+        const previousRoundStartNs = Number(previousRoundAnchor?.tsNsNum || 0);
+        if (!Number.isFinite(previousRoundStartNs) || previousRoundStartNs <= 0) {
+          previousRoundCompletionCheck.reason = "previous_round_anchor_not_found";
+          appendRunLog("STEP3.3", "warning: previous round anchor not found", {
+            ...logCtx,
+            previousRoundLookupStartNs: String(previousRoundLookupStartNs),
+            previousRoundLookupEndNs: String(previousRoundLookupEndNs),
+            previousRoundAnchorExpr,
+          });
+        } else {
+          previousRoundCompletionCheck.reason = "checked";
+          previousRoundCompletionCheck.previousRoundStartNs = String(previousRoundStartNs);
+          previousRoundCompletionCheck.previousRoundEndNs = String(previousRoundLookupEndNs);
+          try {
+            const previousRoundCandidates = await collectCompletionRecordsInRange(
+              previousRoundStartNs,
+              previousRoundLookupEndNs,
+            );
+            const previousRoundMatched = previousRoundCandidates.filter(r =>
+              completionMatchesStartRound(r, previousRoundStartNs),
+            );
+            const previousRoundDistinctAll = distinctCompletionByDeployment(previousRoundMatched);
+            const previousRoundDistinctTop3 = previousRoundDistinctAll.slice(0, 3);
+            const previousRoundContainsTarget = Boolean(
+              targetDeploymentID &&
+                previousRoundDistinctTop3.some(
+                  x => String(x?.deploymentID || "") === String(targetDeploymentID || ""),
+                ),
+            );
+            previousRoundCompletionCheck.previousRoundDistinctCount = previousRoundDistinctTop3.length;
+            previousRoundCompletionCheck.previousRoundContainsTarget = previousRoundContainsTarget;
+            if (previousRoundDistinctTop3.length >= 3 && previousRoundContainsTarget) {
+              completionUsedPreviousRound = true;
+              previousRoundCompletionCheck.usedAsCompletionEvidence = true;
+              completionCandidates = previousRoundCandidates;
+              completionRoundMatched = previousRoundMatched;
+              completionDistinctUsedAll = previousRoundDistinctAll;
+              completionDistinctUsedTop3 = previousRoundDistinctTop3;
+              completionWindowEndNs = previousRoundLookupEndNs;
+              appendRunLog("STEP3.3", "using previous runtime-cache round completion evidence", {
+                ...logCtx,
+                previousRoundStartNs: String(previousRoundStartNs),
+                previousRoundEndNs: String(previousRoundLookupEndNs),
+                previousRoundDistinctCount: previousRoundDistinctTop3.length,
+                previousRoundContainsTarget,
+              });
+            } else if (previousRoundDistinctTop3.length >= 3 && !previousRoundContainsTarget) {
+              shouldRunPostRequestExtension = true;
+              appendRunLog(
+                "STEP3.3",
+                "previous runtime-cache round has 3 distinct deployments but target absent; continue with post-request extension",
+                {
+                  ...logCtx,
+                  previousRoundStartNs: String(previousRoundStartNs),
+                  previousRoundEndNs: String(previousRoundLookupEndNs),
+                  previousRoundDistinctCount: previousRoundDistinctTop3.length,
+                  previousRoundContainsTarget,
+                },
+              );
+            } else {
+              previousRoundCompletionCheck.reason = "previous_round_distinct_lt_3";
+              appendRunLog(
+                "STEP3.3",
+                "previous runtime-cache round still has <3 distinct deployments; skip extension and mark for further analysis",
+                {
+                  ...logCtx,
+                  previousRoundStartNs: String(previousRoundStartNs),
+                  previousRoundEndNs: String(previousRoundLookupEndNs),
+                  previousRoundDistinctCount: previousRoundDistinctTop3.length,
+                },
+              );
+            }
+          } catch (previousRoundCompletionErr) {
+            previousRoundCompletionCheck.reason = "previous_round_completion_query_failed";
+            previousRoundCompletionCheck.error = String(
+              previousRoundCompletionErr?.message || previousRoundCompletionErr,
+            );
+            appendRunLog("STEP3.3", "warning: previous round completion lookup failed", {
+              ...logCtx,
+              previousRoundStartNs: String(previousRoundStartNs),
+              previousRoundEndNs: String(previousRoundLookupEndNs),
+              error: String(previousRoundCompletionErr?.message || previousRoundCompletionErr),
+            });
+          }
+        }
+      } catch (previousRoundErr) {
+        previousRoundCompletionCheck.reason = "previous_round_anchor_query_failed";
+        previousRoundCompletionCheck.error = String(previousRoundErr?.message || previousRoundErr);
+        appendRunLog("STEP3.3", "warning: previous round anchor lookup failed", {
+          ...logCtx,
+          previousRoundLookupStartNs: String(previousRoundLookupStartNs),
+          previousRoundLookupEndNs: String(previousRoundLookupEndNs),
+          previousRoundAnchorExpr,
+          error: String(previousRoundErr?.message || previousRoundErr),
+        });
+      }
+    }
+  }
+  if (shouldRunPostRequestExtension) {
     completionExtensionUsed = true;
-    const postExtend1Minutes = Math.max(
-      1,
-      Number(ANALYSIS_CONFIG.step3_3CompletionExtend1Minutes || 15),
-    );
+    const postExtend1Minutes = Math.max(1, Number(ANALYSIS_CONFIG.step3_3CompletionExtend1Minutes || 15));
     const postExtend2Minutes = Math.max(
       postExtend1Minutes,
       Number(ANALYSIS_CONFIG.step3_3CompletionExtend2Minutes || 30),
@@ -2900,13 +4286,29 @@ async function analyzeStep3_3ForLink(
   appendRunLog("STEP3.3", "runtime cache completion timing checked", {
     ...logCtx,
     targetDeploymentID: targetDeploymentID || null,
+    runtimeCompletionWindowStartNs: String(startNs),
+    runtimeCompletionWindowEndNs: String(completionWindowEndNs),
     completionTimingMatched: completionTiming.matched,
     completionTimingReason: completionTiming.reason,
     completionRoundMatchedOriginalCount: completionRoundMatchedOriginal.length,
     completionRoundMatchedUsedCount: completionRoundMatched.length,
     completionDistinctOriginalCount: completionDistinctOriginalTop3.length,
     completionDistinctExtendCount: completionDistinctUsedTop3.length,
+    runtimeCompletionDistinctDeploymentsOriginalTop3: completionDistinctOriginalTop3
+      .map(x => String(x?.deploymentID || "").trim())
+      .filter(Boolean),
+    runtimeCompletionDistinctDeploymentsUsedTop3: completionDistinctUsedTop3
+      .map(x => String(x?.deploymentID || "").trim())
+      .filter(Boolean),
+    runtimeCompletionDistinctDeploymentsUsedAll: completionDistinctUsedAll
+      .map(x => String(x?.deploymentID || "").trim())
+      .filter(Boolean)
+      .slice(0, 20),
+    runtimeCompletionTargetPresentInOriginalTop3: targetInOriginalTop3,
+    runtimeCompletionTargetPresentInUsedTop3: targetInUsedTop3,
     completionExtensionUsed,
+    completionUsedPreviousRound,
+    previousRoundCompletionCheck,
     completionFoundAfterOriginalWindow,
     earliestCompletionDeploymentID: earliestCompletionMatch?.deploymentID || null,
     earliestCompletionLokiTsNs: earliestCompletionMatch?.lokiTsNs || null,
@@ -2923,12 +4325,23 @@ async function analyzeStep3_3ForLink(
   const hasSuccessBeforeRequest = hasThreeCompletedDeployments;
   const conclusion = hasThreeCompletedDeployments ? "cache_load_success" : "cache_load_unknown";
 
+  // Use the same fixed restart evidence lookback policy as no-anchor fallback.
+  const restartLookbackMinutes = 10;
+  const restartLookbackNs = restartLookbackMinutes * 60 * 1e9;
+  const restartBaseStartNs = Math.max(0, subtractNsWithPrecisionGuard(startNs, restartLookbackNs));
+  const previousRoundStartNsForRestart = Number(previousRoundCompletionCheck?.previousRoundStartNs || 0);
+  const restartFromPreviousRoundNs = Number.isFinite(previousRoundStartNsForRestart) && previousRoundStartNsForRestart > 0
+    ? Math.max(0, subtractNsWithPrecisionGuard(previousRoundStartNsForRestart, restartLookbackNs))
+    : null;
+  const restartQueryStartNs = restartFromPreviousRoundNs == null
+    ? restartBaseStartNs
+    : Math.min(restartBaseStartNs, restartFromPreviousRoundNs);
   const restartExpr =
     `${buildDecisionSelector(env, pod)}` +
     ` != "/live" != "/ready"` +
     ` |~ "starting decision server|starting authz decision server"`;
   const restartJson = await queryLokiForStep(restartExpr, {
-    startNs,
+    startNs: restartQueryStartNs,
     endNs,
     direction: "BACKWARD",
     limit: 20,
@@ -2949,6 +4362,13 @@ async function analyzeStep3_3ForLink(
     count: restartEntries.length,
     entries: restartEntries.slice(0, 20),
     query: restartExpr,
+    startNs: String(restartQueryStartNs),
+    endNs: String(endNs),
+    lookbackNs: String(restartLookbackNs),
+    previousRoundStartNs:
+      Number.isFinite(previousRoundStartNsForRestart) && previousRoundStartNsForRestart > 0
+        ? String(previousRoundStartNsForRestart)
+        : null,
   };
   let uniqueFailureErrors = [];
   let finalConclusion = conclusion;
@@ -3010,7 +4430,7 @@ async function analyzeStep3_3ForLink(
       finalConclusion = "cache_load_failure";
     }
 
-    if (restartEvidence.count === 1 && uniqueFailureErrors.length === 0) {
+    if (restartEvidence.count >= 1 && uniqueFailureErrors.length === 0) {
       // Treat restart warmup as cache load failure per updated categorization policy.
       finalConclusion = "cache_load_failure";
       finalReason = "restart_warmup";
@@ -3029,15 +4449,14 @@ async function analyzeStep3_3ForLink(
     reason: finalReason,
     window: { startNs: String(startNs), endNs: String(endNs) },
     defaultLookupWindow: {
-      startNs: String(defaultLookupStartNs),
-      endNs: String(defaultLookupEndNs),
+      startNs: String(deploymentListCacheWindowStartNs),
+      endNs: String(endNs),
     },
     queries: {
       deploymentListCacheExpr,
       traceExpr: traceID ? traceExpr : null,
       deploymentStateExpr,
       errorExpr,
-      defaultExpr,
       completionExpr,
       restartExpr: restartEvidence.query,
     },
@@ -3057,6 +4476,7 @@ async function analyzeStep3_3ForLink(
     deploymentListCacheCandidatesCount: deploymentListCacheCandidates.length,
     deploymentListCacheCandidatesSample: deploymentListCacheCandidates.slice(0, 30),
     deploymentListCacheRoundsCount: deploymentListCacheRounds.length,
+    deploymentListCacheLatestRoundDistinctDeploymentCount: latestRoundDistinctDeploymentCount,
     deploymentListCacheRoundsLatest2,
     deploymentListCacheCheck,
     deploymentListPostRequestCheck,
@@ -3064,6 +4484,8 @@ async function analyzeStep3_3ForLink(
     deploymentStateCheck,
     completionWindowEndNs: String(completionWindowEndNs),
     completionExtensionUsed,
+    completionUsedPreviousRound,
+    previousRoundCompletionCheck,
     completionFoundAfterOriginalWindow,
     completionCandidatesCount: completionCandidates.length,
     completionCandidatesSample: completionCandidates.slice(0, 20),
@@ -3076,27 +4498,30 @@ async function analyzeStep3_3ForLink(
   };
 }
 
-async function fetchTraceErrorSignatureForReuse(link) {
+async function fetchTraceErrorSignatureForReuse(link, { regionContext = null } = {}) {
   const env = link?.request?.env;
   const pod = link?.request?.pod || null;
   const traceID = String(link?.request?.traceID || "").trim();
   const reqTsNs = Number(link?.request?.lokiTsNs);
-  const reqStartTsNs = Number(link?.request?.requestStartTsNs);
+  const reqStartTsNs = Number(link?.request?.requestStartTimeNs);
   if (!env || !traceID || !Number.isFinite(reqTsNs) || reqTsNs <= 0) return null;
 
   const traceExpr =
     `${buildDecisionSelector(env, pod)}` +
     ` != "/live" != "/ready" |~ "${traceID}"`;
+  const TRACE_LOOKBACK_BEFORE_REQUEST_NS = 2 * 1e9;
+  const TRACE_LOOKAHEAD_AFTER_REQUEST_NS = 5 * 1e9;
   const startNs =
     Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
-      ? Math.floor(reqStartTsNs)
+      ? Math.max(0, Math.floor(reqStartTsNs - TRACE_LOOKBACK_BEFORE_REQUEST_NS))
       : Math.max(0, Math.floor(reqTsNs - 5 * 1e9));
-  const endNs = Math.floor(reqTsNs + 1e6);
+  const endNs = Math.floor(reqTsNs + TRACE_LOOKAHEAD_AFTER_REQUEST_NS);
   const traceJson = await queryLoki(traceExpr, {
     startNs,
     endNs,
     direction: "BACKWARD",
     limit: 200,
+    regionContext,
   });
 
   const entries = [];
@@ -3139,34 +4564,76 @@ async function fetchTraceErrorSignatureForReuse(link) {
   };
 }
 
-async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
+async function buildStep3_3CacheLoadingByEnv(
+  step3_2ByEnv,
+  { regionContext = null, envProgressTracker = null } = {},
+) {
   const byEnv = {};
-  const reuseWindowMinutes = Number(ANALYSIS_CONFIG.step3_3ReuseWindowMinutes || 10) || 10;
-  const reuseWindowNs = Math.floor(reuseWindowMinutes * 60 * 1e9);
+  const fastTimelineEnabled = ANALYSIS_CONFIG.step3_3FastTimelineEnabled !== false;
+  const fastTimelineMinRequestsPerHour = Math.max(
+    0,
+    Number(ANALYSIS_CONFIG.step3_3FastTimelineMinRequestsPerHour || 100),
+  );
+  const stepWindowHours = getConfiguredStepWindowHours();
+  const fastTimelineDecisionByEnv = new Map();
+  const step3_2ByEnvForTimeline = {};
+  for (const [env, item] of Object.entries(step3_2ByEnv || {})) {
+    const requestRecordCount = Number(item?.requestRecordCount || 0);
+    const requestsPerHour = requestRecordCount / stepWindowHours;
+    const eligible = fastTimelineEnabled && requestsPerHour >= fastTimelineMinRequestsPerHour;
+    fastTimelineDecisionByEnv.set(env, {
+      enabled: eligible,
+      requestRecordCount,
+      stepWindowHours,
+      requestsPerHour,
+    });
+    if (eligible) step3_2ByEnvForTimeline[env] = item;
+  }
+  let fastTimelineByEnv = new Map();
+  if (fastTimelineEnabled && Object.keys(step3_2ByEnvForTimeline).length > 0) {
+    try {
+      fastTimelineByEnv = await buildFastTimelinesByEnv(step3_2ByEnvForTimeline, { regionContext });
+    } catch (e) {
+      appendRunLog("STEP3.3", "failed to build fast timelines; fallback to deep-analysis only", {
+        region: regionContext || null,
+        error: String(e?.message || e),
+      });
+      fastTimelineByEnv = new Map();
+    }
+  }
   const envEntries = Object.entries(step3_2ByEnv || {});
   const totalEnvCount = envEntries.length;
 
   for (let envIdx = 0; envIdx < envEntries.length; envIdx += 1) {
     const [env, item] = envEntries[envIdx];
     const links = item.links || [];
-    const skipTraceLookupForReuse = Boolean(
-      ANALYSIS_CONFIG.step3_3SkipTraceLookupWhenStep2UnsplittableLimitHit !== false &&
-        Number(item?.step2UnsplittableLimitHitCount || 0) > 0,
-    );
     const analyzedLinks = [];
     const conclusionCounts = {};
-    const reusableTemplates = [];
-    const reusableTemplatesByUrl = new Map();
-    const signatureCache = new Map();
-    const exactResultCache = new Map();
     const traceSeenCounts = new Map();
     const linkIdentitySeenCounts = new Map();
-    appendRunLog("STEP3.3", "reuse lookup mode for env", {
+    const timelineDecision = fastTimelineDecisionByEnv.get(env) || {
+      enabled: false,
+      requestRecordCount: Number(item?.requestRecordCount || 0),
+      stepWindowHours,
+      requestsPerHour: 0,
+    };
+    const envTimeline = timelineDecision.enabled ? fastTimelineByEnv.get(env) || null : null;
+    let fastPathUsedCount = 0;
+    let deepAnalysisCount = 0;
+    appendRunLog("STEP3.3", "fast timeline mode decision for env", {
       env,
-      skipTraceLookupForReuse,
-      step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
-      step2LimitHitLeafCount: Number(item?.splitMeta?.limitHitLeafCount || 0),
-      step2SplitMaxDepthUsed: Number(item?.splitMeta?.maxSplitDepthUsed || 0),
+      region: regionContext || null,
+      fastTimelineEnabled: timelineDecision.enabled,
+      fastTimelineMinRequestsPerHour,
+      requestRecordCount: timelineDecision.requestRecordCount,
+      stepWindowHours: Number(timelineDecision.stepWindowHours.toFixed(4)),
+      requestsPerHour: Number(timelineDecision.requestsPerHour.toFixed(4)),
+      decisionReason: timelineDecision.enabled ? "high_volume" : "low_volume",
+    });
+    appendRunLog("STEP3.3", "reuse logic disabled; force full analysis per link", {
+      env,
+      fastTimelineEnabled: timelineDecision.enabled,
+      fastTimelineAvailable: Boolean(envTimeline),
     });
 
     function buildLinkExactIdentityKey(link) {
@@ -3181,27 +4648,12 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
       ].join("|");
     }
 
-    function buildLinkSignatureLookupKey(link) {
-      const req = link?.request || {};
-      return [
-        String(req?.env || ""),
-        String(req?.pod || ""),
-        String(req?.traceID || ""),
-        String(req?.lokiTsNs || ""),
-        String(link?.previousLog?.lokiTsNs || ""),
-      ].join("|");
-    }
-
     for (let i = 0; i < links.length; i += 1) {
       const link = links[i];
       const linkExactIdentityKey = buildLinkExactIdentityKey(link);
       const reqUrl = String(link?.request?.url || "");
       const reqTsNs = Number(link?.request?.lokiTsNs);
-      const reqStartTsNs = Number(link?.request?.requestStartTsNs);
-      const reqReuseWindowStartNs =
-        Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
-          ? reqStartTsNs
-          : reqTsNs;
+      const reqStartTsNs = Number(link?.request?.requestStartTimeNs);
       const reqTraceID = String(link?.request?.traceID || "");
       const linkSeenCount = (linkIdentitySeenCounts.get(linkExactIdentityKey) || 0) + 1;
       linkIdentitySeenCounts.set(linkExactIdentityKey, linkSeenCount);
@@ -3219,7 +4671,7 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
           total: links.length,
           traceID: reqTraceID || null,
           requestUrl: reqUrl || null,
-          requestTsNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
+          requestCompleteTimeNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
           repeatedLinkIdentityCount: linkSeenCount,
           linkExactIdentityKey,
         });
@@ -3240,7 +4692,7 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
             total: links.length,
             traceID: reqTraceID,
             requestUrl: reqUrl || null,
-            requestTsNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
+            requestCompleteTimeNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
             repeatedTraceCount: traceSeenCount,
             linkExactIdentityKey,
           });
@@ -3248,149 +4700,43 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
       }
 
       let result = null;
-      let reusedFrom = null;
-      let sigInfoForCurrentLink = null;
+      let fullAnalysisPerformed = false;
 
-      if (exactResultCache.has(linkExactIdentityKey)) {
-        result = deepClone(exactResultCache.get(linkExactIdentityKey));
-      }
-
-      const nearUrlCandidates = (reusableTemplatesByUrl.get(reqUrl) || []).filter(t => {
-        if (!t || t.url !== reqUrl) return false;
-        const tReqStartTsNs = Number(t?.requestStartTsNs);
-        const tReuseWindowStartNs =
-          Number.isFinite(tReqStartTsNs) && tReqStartTsNs > 0 && tReqStartTsNs <= Number(t.requestTsNs)
-            ? tReqStartTsNs
-            : Number(t.requestTsNs);
-        if (!Number.isFinite(reqReuseWindowStartNs) || !Number.isFinite(tReuseWindowStartNs)) {
-          return false;
-        }
-        return Math.abs(reqReuseWindowStartNs - tReuseWindowStartNs) <= reuseWindowNs;
-      });
-
-      if (!result && nearUrlCandidates.length > 0) {
-        if (skipTraceLookupForReuse) {
-          const matchedTemplate =
-            nearUrlCandidates
-              .slice()
-              .sort(
-                (a, b) =>
-                  Math.abs(
-                    (Number.isFinite(Number(a?.requestStartTsNs)) &&
-                    Number(a.requestStartTsNs) > 0 &&
-                    Number(a.requestStartTsNs) <= Number(a.requestTsNs)
-                      ? Number(a.requestStartTsNs)
-                      : Number(a.requestTsNs)) - reqReuseWindowStartNs,
-                  ) -
-                  Math.abs(
-                    (Number.isFinite(Number(b?.requestStartTsNs)) &&
-                    Number(b.requestStartTsNs) > 0 &&
-                    Number(b.requestStartTsNs) <= Number(b.requestTsNs)
-                      ? Number(b.requestStartTsNs)
-                      : Number(b.requestTsNs)) - reqReuseWindowStartNs,
-                  ),
-              )[0] || null;
-          if (matchedTemplate) {
-            result = deepClone(matchedTemplate.result);
-            result.reason = "reused_within_10m_same_url_only_due_to_limit_hit";
-            result.reuseMeta = {
-              reused: true,
-              sourceTraceID: matchedTemplate.traceID,
-              sourceRequestTsNs: String(matchedTemplate.requestTsNs),
-              sourceRequestStartTsNs: matchedTemplate.requestStartTsNs || null,
-              sourceSignature: matchedTemplate.signature || null,
-              currentSignature: null,
-              windowNs: String(reuseWindowNs),
-              signatureQuery: null,
-              signatureWindow: null,
-              reuseMode: "url_only_due_to_step2_limit_hit",
-              skipTraceLookupForReuse: true,
-              step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
-            };
-            reusedFrom = matchedTemplate.traceID;
-            appendRunLog(
-              "STEP3.3",
-              `reused prior result by url-only in ${reuseWindowMinutes}m window (signature lookup skipped due to step2 limit-hit)`,
-              {
-                env,
-                traceID: reqTraceID,
-                requestUrl: reqUrl || null,
-                reusedFromTraceID: matchedTemplate.traceID,
-                skipTraceLookupForReuse: true,
-                step2UnsplittableLimitHitCount: Number(item?.step2UnsplittableLimitHitCount || 0),
-              },
-            );
-          }
-        } else {
-          const sigKey = buildLinkSignatureLookupKey(link);
-          let sigInfo = signatureCache.get(sigKey) || null;
-          if (!sigInfo) {
-            sigInfo = await fetchTraceErrorSignatureForReuse(link);
-            signatureCache.set(sigKey, sigInfo || null);
-          }
-          sigInfoForCurrentLink = sigInfo || null;
-          const signature = sigInfo?.signature || null;
-          if (signature) {
-            const matchedTemplate =
-              nearUrlCandidates.find(t => t.signature === signature) || null;
-            if (matchedTemplate) {
-              result = deepClone(matchedTemplate.result);
-              result.reason = "reused_within_10m_same_url_same_error";
-              result.reuseMeta = {
-                reused: true,
-                sourceTraceID: matchedTemplate.traceID,
-                sourceRequestTsNs: String(matchedTemplate.requestTsNs),
-                sourceRequestStartTsNs: matchedTemplate.requestStartTsNs || null,
-                sourceSignature: matchedTemplate.signature,
-                currentSignature: signature,
-                windowNs: String(reuseWindowNs),
-                signatureQuery: sigInfo?.query || null,
-                signatureWindow: sigInfo?.window || null,
-              };
-              reusedFrom = matchedTemplate.traceID;
-              appendRunLog(
-                "STEP3.3",
-                `reused prior result by url+error signature in ${reuseWindowMinutes}m window`,
-                {
-                  env,
-                  traceID: reqTraceID,
-                  requestUrl: reqUrl || null,
-                  reusedFromTraceID: matchedTemplate.traceID,
-                  signature,
-                },
-              );
-            }
+      if (!result && envTimeline) {
+        const fastResult = fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline);
+        if (fastResult) {
+          if (fastResult.fastPathFallbackRequired) {
+            appendRunLog("STEP3.3", "timeline fast-path fallback to full analysis for link", {
+              env,
+              traceID: reqTraceID || null,
+              pod: String(link?.request?.pod || "") || null,
+              requestUrl: reqUrl || null,
+              fallbackReason: fastResult?.fallbackReason || null,
+              window: fastResult?.window || null,
+              completionDistinctExtendCount:
+                Number(fastResult?.completionDistinctExtendCount || 0),
+            });
+          } else {
+            result = fastResult;
+            fastPathUsedCount += 1;
+            appendRunLog("STEP3.3", "timeline fast-path used for link", {
+              env,
+              traceID: reqTraceID || null,
+              pod: String(link?.request?.pod || "") || null,
+              requestUrl: reqUrl || null,
+              targetDeploymentID: result?.targetDeploymentID || null,
+              conclusion: result?.conclusion || null,
+            });
           }
         }
       }
 
       if (!result) {
+        deepAnalysisCount += 1;
+        fullAnalysisPerformed = true;
         result = await analyzeStep3_3ForLink(link, {
-          prefetchedTraceErrorSummary: sigInfoForCurrentLink?.traceErrorSummary || null,
+          queryLokiFn: (expr, opts = {}) => queryLoki(expr, { ...opts, regionContext }),
         });
-        const signatureFromResult = extractErrorSignatureFromTraceEntry(
-          result?.traceErrorSummary?.matchedEntry,
-        );
-        if (signatureFromResult && reqUrl && Number.isFinite(reqTsNs)) {
-          const template = {
-            url: reqUrl,
-            requestTsNs: reqTsNs,
-            requestStartTsNs:
-              Number.isFinite(reqStartTsNs) && reqStartTsNs > 0 && reqStartTsNs <= reqTsNs
-                ? String(reqStartTsNs)
-                : null,
-            signature: signatureFromResult,
-            traceID: String(link?.request?.traceID || ""),
-            result: deepClone(result),
-          };
-          reusableTemplates.push(template);
-          if (!reusableTemplatesByUrl.has(reqUrl)) reusableTemplatesByUrl.set(reqUrl, []);
-          reusableTemplatesByUrl.get(reqUrl).push(template);
-        }
-      }
-
-      if (result) {
-        exactResultCache.set(linkExactIdentityKey, deepClone(result));
       }
 
       const duplicateCount = Number(link?.request?.duplicateCount || 1);
@@ -3430,6 +4776,8 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
         deploymentStateCheck: result.deploymentStateCheck || null,
         completionWindowEndNs: result.completionWindowEndNs || null,
         completionExtensionUsed: Boolean(result.completionExtensionUsed),
+        completionUsedPreviousRound: Boolean(result.completionUsedPreviousRound),
+        previousRoundCompletionCheck: result.previousRoundCompletionCheck || null,
         completionFoundAfterOriginalWindow: Boolean(result.completionFoundAfterOriginalWindow),
         completionCandidatesCount: result.completionCandidatesCount || 0,
         completionCandidatesSample: result.completionCandidatesSample || [],
@@ -3440,8 +4788,9 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
         uniqueFailureErrors: result.uniqueFailureErrors || [],
         restartEvidence: result.restartEvidence || { count: 0, entries: [], query: null },
         queries: result.queries || null,
-        reusedFromTraceID: reusedFrom,
-        reuseMeta: result.reuseMeta || null,
+        reusedFromTraceID: null,
+        reuseMeta: null,
+        fullAnalysisPerformed,
       });
 
       if ((i + 1) % 50 === 0) {
@@ -3458,6 +4807,9 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
       requestRecordCount: weightedRequestCount,
       dedupedRequestRecordCount: links.length,
       conclusionCounts,
+      fastPathUsedCount,
+      deepAnalysisCount,
+      reusedResultCount: 0,
       links: analyzedLinks,
       failureSamples: analyzedLinks
         .filter(x => x.conclusion === "cache_load_failure")
@@ -3470,15 +4822,28 @@ async function buildStep3_3CacheLoadingByEnv(step3_2ByEnv) {
       requestRecordCount: weightedRequestCount,
       dedupedRequestRecordCount: links.length,
       conclusionCounts,
+      fastPathUsedCount,
+      deepAnalysisCount,
+      reusedResultCount: 0,
+      fastTimelineEnabled: timelineDecision.enabled,
+      fastTimelineMinRequestsPerHour,
+      requestsPerHour: Number(timelineDecision.requestsPerHour.toFixed(4)),
+      fastTimelineAvailable: Boolean(envTimeline),
     });
-    const processedEnvCount = envIdx + 1;
-    const progressPct =
-      totalEnvCount > 0 ? Number(((processedEnvCount / totalEnvCount) * 100).toFixed(2)) : 100;
+    const progress =
+      envProgressTracker && typeof envProgressTracker.markEnvProcessed === "function"
+        ? envProgressTracker.markEnvProcessed()
+        : {
+            processedEnvCount: envIdx + 1,
+            totalEnvCount,
+            progressPct: totalEnvCount > 0 ? Number((((envIdx + 1) / totalEnvCount) * 100).toFixed(2)) : 100,
+          };
     appendRunLog("STEP3.3", "env analysis progress", {
       env,
-      processedEnvCount,
-      totalEnvCount,
-      progressPct,
+      region: regionContext || null,
+      processedEnvCount: progress.processedEnvCount,
+      totalEnvCount: progress.totalEnvCount,
+      progressPct: progress.progressPct,
     });
   }
 
@@ -3491,6 +4856,9 @@ function summarizeStep3_3CacheLoading(step3_3ByEnv) {
     out[env] = {
       requestRecordCount: item.requestRecordCount || 0,
       dedupedRequestRecordCount: item.dedupedRequestRecordCount || 0,
+      fastPathUsedCount: item.fastPathUsedCount || 0,
+      deepAnalysisCount: item.deepAnalysisCount || 0,
+      reusedResultCount: item.reusedResultCount || 0,
       conclusionCounts: item.conclusionCounts || {},
     };
   }
@@ -3591,6 +4959,14 @@ function buildStep3_4DeploymentCacheCheck(
 
   const rootCauseTable = [];
   const furtherAnalysisTable = [];
+  const buildFurtherAnalysisIdentityKey = row =>
+    [
+      String(row?.env || ""),
+      String(row?.traceID || ""),
+      String(row?.requestLokiTsNs || ""),
+      String(row?.url || ""),
+      String(row?.pod || ""),
+    ].join("|");
 
   for (const [env, s2] of Object.entries(step2ByEnv || {})) {
     if (!s2?.error) continue;
@@ -3601,7 +4977,7 @@ function buildStep3_4DeploymentCacheCheck(
       pod: null,
       requestTimestamp: null,
       requestLokiTsNs: null,
-      requestStartTsNs: null,
+      requestStartTimeNs: null,
       requestElapsedTime: null,
       requestElapsedTimeMs: null,
       requestElapsedTimeRoundedMs: null,
@@ -3639,7 +5015,7 @@ function buildStep3_4DeploymentCacheCheck(
         pod: request.pod || null,
         requestTimestamp: request.timestamp || null,
         requestLokiTsNs: request.lokiTsNs || null,
-        requestStartTsNs: request.requestStartTsNs || null,
+        requestStartTimeNs: request.requestStartTimeNs || null,
         requestElapsedTime: request.elapsedTime || null,
         requestElapsedTimeMs:
           Number.isFinite(Number(request.elapsedTimeMs)) ? Number(request.elapsedTimeMs) : null,
@@ -3716,12 +5092,49 @@ function buildStep3_4DeploymentCacheCheck(
         requestedDeploymentID: baseRow.requestedDeploymentID || null,
         resolvedDefaultDeploymentID: baseRow.resolvedDefaultDeploymentID || null,
       };
+      const restartEvidenceCount = Math.max(
+        Number(link?.restartEvidence?.count || 0),
+        Array.isArray(link?.restartEvidence?.entries) ? link.restartEvidence.entries.length : 0,
+      );
+      const failureEvidenceCount = Number(
+        link?.failureEvidenceCount ??
+          (Array.isArray(link?.uniqueFailureErrors) ? link.uniqueFailureErrors.length : 0),
+      );
       const restartWarmupLikely =
-        Number(link?.restartEvidence?.count || 0) >= 1 &&
-        Number(link?.failureEvidenceCount || 0) === 0;
+        String(link?.reason || "") === "restart_warmup" ||
+        (restartEvidenceCount >= 1 &&
+          (failureEvidenceCount === 0 ||
+            String(link?.traceErrorSummary?.category || "") === "runtime_services_not_found"));
+      const restartWarmupConfirmedByStep3 =
+        (baseRow.step3_3Conclusion === "cache_load_failure" ||
+          baseRow.step3_3Conclusion === "cache_load_restart_warmup") &&
+        (String(link?.reason || "") === "restart_warmup" ||
+          (restartEvidenceCount >= 1 && failureEvidenceCount === 0));
       const completionDistinctExtendCount = Number(
         link?.completionDistinctExtendCount ?? link?.completionDistinctUsedCount ?? 0,
       );
+      const latestRoundDistinctDeploymentCount = Number(
+        link?.deploymentListCacheLatestRoundDistinctDeploymentCount || 0,
+      );
+
+      // Step 3.3 has already concluded restart warmup with evidence for this link.
+      // Classify it immediately to avoid falling through to inconclusive cache cross-check paths.
+      if (restartWarmupConfirmedByStep3) {
+        rootCauseTable.push({
+          ...baseRow,
+          result: "single_restart_log_in_step3_3_window",
+          rootCause: "404_due_to_decision_service_restart_cache_warmup",
+        });
+        appendRunLog("STEP3.4", "restart warmup confirmed by Step3.3; classify before cache cross-check", {
+          ...decisionLogCtx,
+          result: "single_restart_log_in_step3_3_window",
+          rootCause: "404_due_to_decision_service_restart_cache_warmup",
+          restartEvidenceCount,
+          failureEvidenceCount,
+          step3Reason: String(link?.reason || "") || null,
+        });
+        continue;
+      }
 
       if (link.traceErrorSummary?.category === "runtime_services_not_found") {
         if (completionDistinctExtendCount > 3) {
@@ -3779,6 +5192,23 @@ function buildStep3_4DeploymentCacheCheck(
           completionDistinctExtendCount,
           completionExtensionUsed: Boolean(link.completionExtensionUsed),
         });
+        // If Step 3.3 already indicates restart warmup for runtime-services traces,
+        // classify it immediately instead of falling into unknown/cache-crosscheck handling.
+        if (restartWarmupLikely && baseRow.step3_3Conclusion !== "cache_load_success") {
+          rootCauseTable.push({
+            ...baseRow,
+            result: "restart_evidence_preempts_runtime_services_fallthrough",
+            rootCause: "404_due_to_decision_service_restart_cache_warmup",
+          });
+          appendRunLog("STEP3.4", "restart evidence preempts runtime services fallthrough", {
+            ...decisionLogCtx,
+            result: "restart_evidence_preempts_runtime_services_fallthrough",
+            rootCause: "404_due_to_decision_service_restart_cache_warmup",
+            restartEvidenceCount: Number(link?.restartEvidence?.count || 0),
+            failureEvidenceCount: Number(link?.failureEvidenceCount || 0),
+          });
+          continue;
+        }
       }
 
       if (link.traceErrorSummary?.category === "deployment_list_not_found") {
@@ -3795,6 +5225,28 @@ function buildStep3_4DeploymentCacheCheck(
               rootCause: "404_due_to_decision_service_restart_cache_warmup",
               restartEvidenceCount: Number(link?.restartEvidence?.count || 0),
             });
+            continue;
+          }
+          if (
+            String(link.deploymentListPostRequestCheck?.reason || "") ===
+            "skipped_target_missing_in_last_round_with_3_distinct_deployments"
+          ) {
+            rootCauseTable.push({
+              ...baseRow,
+              result: "requested_deployment_not_in_list_cache",
+              rootCause: "404_due_to_deployment_not_in_top_3_list_cache",
+            });
+            appendRunLog(
+              "STEP3.4",
+              "root cause: target missing in complete latest deployment-list top3 (post-check skipped)",
+              {
+                ...decisionLogCtx,
+                result: "requested_deployment_not_in_list_cache",
+                rootCause: "404_due_to_deployment_not_in_top_3_list_cache",
+                latestRoundDistinctDeploymentCount,
+                completionDistinctExtendCount,
+              },
+            );
             continue;
           }
           if (link.deploymentListPostRequestCheck?.checked) {
@@ -4170,9 +5622,36 @@ function buildStep3_4DeploymentCacheCheck(
     });
   }
 
+  const fullAnalysisFurtherAnalysisIdentitySet = new Set();
+  for (const [env, item] of Object.entries(step3_3ByEnv || {})) {
+    for (const link of item?.links || []) {
+      if (!Boolean(link?.fullAnalysisPerformed)) continue;
+      const request = link?.request || {};
+      fullAnalysisFurtherAnalysisIdentitySet.add(
+        buildFurtherAnalysisIdentityKey({
+          env,
+          traceID: request.traceID || null,
+          requestLokiTsNs: request.lokiTsNs || null,
+          url: request.url || null,
+          pod: request.pod || null,
+        }),
+      );
+    }
+  }
+  const filteredFurtherAnalysisTable = furtherAnalysisTable.filter(row =>
+    fullAnalysisFurtherAnalysisIdentitySet.has(buildFurtherAnalysisIdentityKey(row)),
+  );
+  if (filteredFurtherAnalysisTable.length !== furtherAnalysisTable.length) {
+    appendRunLog("STEP3.4", "filtered further analysis table to full-analysis links only", {
+      beforeCount: furtherAnalysisTable.length,
+      afterCount: filteredFurtherAnalysisTable.length,
+      removedCount: furtherAnalysisTable.length - filteredFurtherAnalysisTable.length,
+    });
+  }
+
   return {
     rootCauseTable: alignedRootCauseTable,
-    furtherAnalysisTable,
+    furtherAnalysisTable: filteredFurtherAnalysisTable,
   };
 }
 
@@ -4193,7 +5672,195 @@ function summarizeStep3_4(step3_4Result) {
   };
 }
 
-function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, step3_3ByEnv = {}) {
+function isLikelyCacheLoadingErrorContext(parsedObj, rawLine) {
+  const text = `${String(parsedObj?.message || "")} ${String(parsedObj?.error || "")} ${String(
+    rawLine || "",
+  )}`.toLowerCase();
+  return (
+    text.includes("cache") ||
+    text.includes("start loading policies") ||
+    text.includes("role mappings for all deployments") ||
+    text.includes("prepare decision server cache") ||
+    text.includes("deployment list cache")
+  );
+}
+
+async function runMandatoryFurtherAnalysisLokiChecks(
+  step3_4Result,
+  { regionContext = null, queryLokiFn = null } = {},
+) {
+  const queryLokiForStep = typeof queryLokiFn === "function" ? queryLokiFn : queryLoki;
+  const rows = step3_4Result?.furtherAnalysisTable || [];
+  const lookbackMinutes = 10;
+  const lookbackNs = lookbackMinutes * 60 * 1e9;
+  const evidenceByCaseKey = {};
+  const queryResultCache = new Map();
+  let checkedRowCount = 0;
+  let skippedRowCount = 0;
+  let restartHitRowCount = 0;
+  let cacheErrorHitRowCount = 0;
+  let queryCacheHitCount = 0;
+  let queryExecutedCount = 0;
+
+  async function queryWithCache(expr, opts) {
+    const key = JSON.stringify({
+      expr: String(expr || ""),
+      startNs: String(opts?.startNs ?? ""),
+      endNs: String(opts?.endNs ?? ""),
+      direction: String(opts?.direction || ""),
+      limit: Number(opts?.limit || 0),
+      regionContext: String(opts?.regionContext || ""),
+    });
+    if (queryResultCache.has(key)) {
+      queryCacheHitCount += 1;
+      return queryResultCache.get(key);
+    }
+    queryExecutedCount += 1;
+    const result = await queryLokiForStep(expr, opts);
+    queryResultCache.set(key, result);
+    return result;
+  }
+
+  for (const row of rows) {
+    const env = String(row?.env || "").trim();
+    const pod = String(row?.pod || "").trim();
+    const traceID = String(row?.traceID || "").trim() || null;
+    const reqTsNs = Number(row?.requestLokiTsNs);
+    const caseKey = [env, traceID || "", String(row?.requestLokiTsNs || ""), String(row?.url || ""), pod].join(
+      "|",
+    );
+
+    if (!env || !pod || !Number.isFinite(reqTsNs) || reqTsNs <= 0) {
+      skippedRowCount += 1;
+      evidenceByCaseKey[caseKey] = {
+        checked: false,
+        reason: "missing_env_or_pod_or_request_timestamp",
+      };
+      appendRunLog("STEP3.4", "mandatory 10m further-analysis Loki checks skipped", {
+        env: env || null,
+        traceID,
+        pod: pod || null,
+        requestLokiTsNs: Number.isFinite(reqTsNs) ? String(reqTsNs) : null,
+        reason: "missing_env_or_pod_or_request_timestamp",
+      });
+      continue;
+    }
+
+    const startNs = Math.max(0, subtractNsWithPrecisionGuard(reqTsNs, lookbackNs));
+    const endNs = subtractNsWithPrecisionGuard(reqTsNs, 1);
+    const selector = `${buildDecisionSelector(env, pod)} != "/live" != "/ready"`;
+    const restartExpr = `${selector} |~ "starting decision server|starting authz decision server"`;
+    const cacheErrorExpr = `${selector} |~ \`"level"\\s*:\\s*"error"|"error"\\s*:|panic|exception|failed\``;
+
+    const [restartJson, cacheErrorJson] = await Promise.all([
+      queryWithCache(restartExpr, {
+        startNs,
+        endNs,
+        direction: "BACKWARD",
+        limit: 200,
+        regionContext,
+      }),
+      queryWithCache(cacheErrorExpr, {
+        startNs,
+        endNs,
+        direction: "BACKWARD",
+        limit: 1000,
+        regionContext,
+      }),
+    ]);
+
+    const restartEntries = [];
+    for (const stream of restartJson?.data?.result || []) {
+      for (const [tsNs, line] of stream.values || []) {
+        const parsed = extractJsonObjectFromLogLine(line);
+        restartEntries.push({
+          lokiTsNs: String(tsNs),
+          timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
+          message: parsed?.message ? String(parsed.message) : null,
+          line: String(line || ""),
+        });
+      }
+    }
+
+    const cacheErrorEntries = [];
+    for (const stream of cacheErrorJson?.data?.result || []) {
+      for (const [tsNs, line] of stream.values || []) {
+        const parsed = extractJsonObjectFromLogLine(line);
+        const rec = extractErrorRecordFromParsedLogObject(parsed);
+        if (!rec) continue;
+        if (!isLikelyCacheLoadingErrorContext(parsed, line)) continue;
+        cacheErrorEntries.push({
+          lokiTsNs: String(tsNs),
+          timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
+          message: parsed?.message ? String(parsed.message) : null,
+          error: parsed?.error ? String(parsed.error) : null,
+          display: rec.display || null,
+          line: String(line || ""),
+        });
+      }
+    }
+
+    checkedRowCount += 1;
+    if (restartEntries.length > 0) restartHitRowCount += 1;
+    if (cacheErrorEntries.length > 0) cacheErrorHitRowCount += 1;
+    evidenceByCaseKey[caseKey] = {
+      checked: true,
+      requestLokiTsNs: String(reqTsNs),
+      startNs: String(startNs),
+      endNs: String(endNs),
+      restartQuery: restartExpr,
+      cacheErrorQuery: cacheErrorExpr,
+      restartEvidenceCount: restartEntries.length,
+      cacheLoadErrorEvidenceCount: cacheErrorEntries.length,
+      restartEvidenceSample: restartEntries.slice(0, 5),
+      cacheLoadErrorEvidenceSample: cacheErrorEntries.slice(0, 5),
+    };
+    appendRunLog("STEP3.4", "mandatory 10m further-analysis Loki checks completed", {
+      env,
+      traceID,
+      pod,
+      requestLokiTsNs: String(reqTsNs),
+      windowStartNs: String(startNs),
+      windowEndNs: String(endNs),
+      restartEvidenceCount: restartEntries.length,
+      cacheLoadErrorEvidenceCount: cacheErrorEntries.length,
+      restartQuery: restartExpr,
+      cacheErrorQuery: cacheErrorExpr,
+    });
+  }
+
+  const summary = {
+    lookbackMinutes,
+    checkedRowCount,
+    skippedRowCount,
+    restartHitRowCount,
+    cacheErrorHitRowCount,
+    queryExecutedCount,
+    queryCacheHitCount,
+    evidenceByCaseKey,
+  };
+  if (step3_4Result && typeof step3_4Result === "object") {
+    step3_4Result.mandatoryFurtherChecks = summary;
+  }
+  appendRunLog("STEP3.4", "mandatory 10m further-analysis Loki checks summary", {
+    lookbackMinutes,
+    totalFurtherRows: rows.length,
+    checkedRowCount,
+    skippedRowCount,
+    restartHitRowCount,
+    cacheErrorHitRowCount,
+    queryExecutedCount,
+    queryCacheHitCount,
+  });
+  return summary;
+}
+
+function buildStep3_4SummaryByEnvTable(
+  step3_4Result,
+  step2SummaryByEnv = {},
+  step3_3ByEnv = {},
+  recoveryByEnv = {},
+) {
   const rootCauseToSummaryColumn = {
     "404_due_to_runtime_cache_not_ready_yet": "cache_not_ready_yet",
     "404_due_to_deployment_not_ready_in_deployment_list_cache":
@@ -4216,40 +5883,16 @@ function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, st
     "runtime_services_cache_load_failure",
     "root_cause_unknown",
   ];
-  const reuseCountByEnv = {};
-  for (const [env, item] of Object.entries(step3_3ByEnv || {})) {
-    let reuseCount = 0;
-    for (const link of item?.links || []) {
-      const reason = String(link?.reason || "");
-      if (
-        reason !== "reused_within_10m_same_url_same_error" &&
-        reason !== "reused_within_10m_same_url_only_due_to_limit_hit"
-      ) {
-        continue;
-      }
-      reuseCount += Number(link?.request?.duplicateCount || 1);
-    }
-    reuseCountByEnv[env] = reuseCount;
-  }
   const byEnv = {};
   const rootCauseCountsByEnv = {};
   const ensureEnv = env => {
     const key = String(env || "");
-    const step2MatchedLineCount = Number(step2SummaryByEnv?.[key]?.matchedLineCount || 0);
-    const step2EstimatedTotal404 = Number(step2SummaryByEnv?.[key]?.estimatedTotal404 || 0);
-    const step2UnsplittableLimitHitCount = Number(
-      step2SummaryByEnv?.[key]?.unsplittableLimitHitCount || 0,
-    );
     if (!byEnv[key]) {
       const row = {
         env: key,
         total404: 0,
         rootCauseCount: 0,
-        reuseRootCauseCourt: Number(reuseCountByEnv?.[key] || 0),
-        furtherAnalysisCount: 0,
-        step2MatchedLineCount,
-        step2EstimatedTotal404,
-        step2UnsplittableLimitHitCount,
+        recoveryStatus: null,
       };
       for (const col of summaryRootCauseColumns) row[col] = 0;
       byEnv[key] = row;
@@ -4281,61 +5924,56 @@ function buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv = {}, st
     const x = ensureEnv(row.env);
     const dup = Number(row?.duplicateCount || 1);
     x.total404 += dup;
-    x.furtherAnalysisCount += dup;
+    x.rootCauseCount += dup;
+    x.root_cause_unknown += dup;
   }
 
-  // For unsplittable limit-hit envs, allocate estimated extra volume to either:
-  // - the single identified root cause category, or
-  // - root_cause_unknown (if multiple/no identified root cause categories).
+  // Reconcile per-env totals with raw Step2 matched volume.
+  // Invariant:
+  // - total404 must equal Step2 raw matched count when Step2 data exists.
+  // - total404 must equal the sum of the four summary root-cause columns.
   for (const row of Object.values(byEnv)) {
     const env = String(row?.env || "");
-    const step2MatchedLineCount = Number(row?.step2MatchedLineCount || 0);
-    const estimated = Number(row?.step2EstimatedTotal404 || 0);
-    const unsplittableLimitHitCount = Number(row?.step2UnsplittableLimitHitCount || 0);
-    const extraEstimatedCount =
-      Number.isFinite(estimated) && Number.isFinite(step2MatchedLineCount)
-        ? Math.max(0, estimated - step2MatchedLineCount)
-        : 0;
+    const hasStep2MatchedCount =
+      step2SummaryByEnv &&
+      Object.prototype.hasOwnProperty.call(step2SummaryByEnv, env) &&
+      Number.isFinite(Number(step2SummaryByEnv?.[env]?.matchedLineCount));
+    if (!hasStep2MatchedCount) continue;
 
-    if (unsplittableLimitHitCount > 0 && extraEstimatedCount > 0) {
-      const causeMap = rootCauseCountsByEnv[env] || new Map();
-      const identifiedRootCauses = [...causeMap.keys()].filter(Boolean);
+    const rawMatchedCount = Number(step2SummaryByEnv?.[env]?.matchedLineCount || 0);
+    const knownRootCauseCount =
+      Number(row.cache_not_ready_yet || 0) +
+      Number(row.deployment_not_in_top_3_latest_deployments || 0) +
+      Number(row.runtime_services_cache_load_failure || 0);
 
-      if (identifiedRootCauses.length === 1) {
-        const onlyCause = identifiedRootCauses[0];
-        const summaryCol = rootCauseToSummaryColumn[onlyCause];
-        if (summaryCol) {
-          row[summaryCol] += extraEstimatedCount;
-        } else {
-          row.root_cause_unknown += extraEstimatedCount;
-        }
-        row.rootCauseCount += extraEstimatedCount;
-        row.reuseRootCauseCourt += extraEstimatedCount;
-        row.total404 += extraEstimatedCount;
-        appendRunLog("STEP3.4", "estimated 404 allocated to single identified root cause", {
-          env,
-          identifiedRootCause: onlyCause,
-          step2MatchedLineCount,
-          step2EstimatedTotal404: estimated,
-          extraEstimatedCount,
-          unsplittableLimitHitCount,
-        });
-      } else {
-        row.root_cause_unknown += extraEstimatedCount;
-        row.rootCauseCount += extraEstimatedCount;
-        row.furtherAnalysisCount += extraEstimatedCount;
-        row.total404 += extraEstimatedCount;
-        appendRunLog("STEP3.4", "estimated 404 allocated to root_cause_unknown", {
-          env,
-          identifiedRootCauseCount: identifiedRootCauses.length,
-          identifiedRootCauses,
-          step2MatchedLineCount,
-          step2EstimatedTotal404: estimated,
-          extraEstimatedCount,
-          unsplittableLimitHitCount,
-        });
-      }
+    if (knownRootCauseCount > rawMatchedCount) {
+      appendRunLog("STEP3.4", "summary reconciliation warning: known causes exceed step2 matched count", {
+        env,
+        step2MatchedLineCount: rawMatchedCount,
+        knownRootCauseCount,
+        cache_not_ready_yet: Number(row.cache_not_ready_yet || 0),
+        deployment_not_in_top_3_latest_deployments: Number(
+          row.deployment_not_in_top_3_latest_deployments || 0,
+        ),
+        runtime_services_cache_load_failure: Number(
+          row.runtime_services_cache_load_failure || 0,
+        ),
+      });
     }
+
+    row.root_cause_unknown = Math.max(0, rawMatchedCount - knownRootCauseCount);
+    row.rootCauseCount =
+      Number(row.cache_not_ready_yet || 0) +
+      Number(row.deployment_not_in_top_3_latest_deployments || 0) +
+      Number(row.runtime_services_cache_load_failure || 0) +
+      Number(row.root_cause_unknown || 0);
+    row.total404 = row.rootCauseCount;
+  }
+
+  for (const row of Object.values(byEnv)) {
+    const env = String(row?.env || "");
+    const recovery = recoveryByEnv?.[env] || null;
+    row.recoveryStatus = recovery?.recoveryStatus || "not_sure";
   }
 
   return Object.values(byEnv).sort((a, b) => String(a.env).localeCompare(String(b.env)));
@@ -4432,40 +6070,63 @@ function buildStep2CompactSummary(step2ByEnv) {
   return out;
 }
 
-async function runDecision404AnalysisForRegion(region) {
-  ACTIVE_REGION = String(region || "").trim();
-  ACTIVE_REGION_CONFIG = buildRegionConfig(ACTIVE_REGION);
-  appendRunLog("RUN", "Region analysis started", {
-    region: ACTIVE_REGION,
-    displayName: ACTIVE_REGION_CONFIG.displayName,
-    mimirUid: ACTIVE_REGION_CONFIG.mimirUid,
-    lokiUid: ACTIVE_REGION_CONFIG.lokiUid,
-  });
-
+function getStep1WindowConfig() {
   const step1RangeStartMs = new Date(ANALYSIS_CONFIG.step1RangeStartPst).getTime();
   const step1RangeEndMs = new Date(ANALYSIS_CONFIG.step1RangeEndPst).getTime();
   const step1RangeStartSec = Math.floor(step1RangeStartMs / 1000);
   const step1RangeEndSec = Math.floor(step1RangeEndMs / 1000);
-  const STEP1_MIMIR_HOURS = Math.round((step1RangeEndMs - step1RangeStartMs) / (60 * 60 * 1000));
+  const step1MimirHours = Math.round((step1RangeEndMs - step1RangeStartMs) / (60 * 60 * 1000));
+  return {
+    step1RangeStartMs,
+    step1RangeEndMs,
+    step1RangeStartSec,
+    step1RangeEndSec,
+    step1MimirHours,
+  };
+}
+
+async function runStep1ForRegion(region, { envProgressTracker = null } = {}) {
+  const activeRegion = String(region || "").trim();
+  const activeRegionConfig = buildRegionConfig(activeRegion);
+  appendRunLog("RUN", "Region analysis started", {
+    region: activeRegion,
+    displayName: activeRegionConfig.displayName,
+    mimirUid: activeRegionConfig.mimirUid,
+    lokiUid: activeRegionConfig.lokiUid,
+  });
+
+  const { step1RangeStartMs, step1RangeEndMs, step1RangeStartSec, step1RangeEndSec, step1MimirHours } =
+    getStep1WindowConfig();
 
   const expr =
     'sum by (prd_env) (rate(application_processed_requests_total{prd_fleet="faaas-prod", job="authz-decision", statuscode=~"404"}[5m])) > 0';
   const mimirJson = await queryMimirRange(expr, {
     stepSec: 300,
-    hours: STEP1_MIMIR_HOURS,
+    hours: step1MimirHours,
     startSec: step1RangeStartSec,
     endSec: step1RangeEndSec,
+    regionContext: activeRegion,
   });
   const summary = summarizeDecision404Series(mimirJson);
   appendRunLog("STEP1", "Mimir query completed", {
-    region: ACTIVE_REGION,
+    region: activeRegion,
     impactedEnvCount: summary.impactedEnvs.length,
     rangeStartUtc: new Date(step1RangeStartMs).toISOString(),
     rangeEndUtc: new Date(step1RangeEndMs).toISOString(),
   });
+  if (envProgressTracker && typeof envProgressTracker.registerRegion === "function") {
+    const p = envProgressTracker.registerRegion(activeRegion, summary.impactedEnvs.length);
+    appendRunLog("RUN", "Global env progress registered for region", {
+      region: activeRegion,
+      regionImpactedEnvCount: summary.impactedEnvs.length,
+      processedEnvCount: p.processedEnvCount,
+      totalEnvCount: p.totalEnvCount,
+      progressPct: p.progressPct,
+    });
+  }
 
   console.log(
-    `Step 1 complete: decision service 404s in ${ACTIVE_REGION_CONFIG.displayName} (${ACTIVE_REGION}) (fixed range)`,
+    `Step 1 complete: decision service 404s in ${activeRegionConfig.displayName} (${activeRegion}) (fixed range)`,
   );
   console.log(
     `Step 1 range (PST): ${ANALYSIS_CONFIG.step1RangeStartPst} to ${ANALYSIS_CONFIG.step1RangeEndPst} | UTC: ${new Date(
@@ -4476,14 +6137,48 @@ async function runDecision404AnalysisForRegion(region) {
   console.log("Impacted env list:", summary.impactedEnvs);
   console.log("Per-env summary:", summary.byEnv);
 
+  return {
+    region: activeRegion,
+    activeRegionConfig,
+    summary,
+    step1RangeStartMs,
+    step1RangeEndMs,
+    step1RangeStartSec,
+    step1RangeEndSec,
+    step1MimirHours,
+  };
+}
+
+async function runDecision404AnalysisForRegion(region, { envProgressTracker = null, step1Result = null } = {}) {
+  const activeRegion = String(region || "").trim();
+  const activeRegionConfig = buildRegionConfig(activeRegion);
+  const resolvedStep1 =
+    step1Result && step1Result.summary
+      ? step1Result
+      : await runStep1ForRegion(region);
+
+  const {
+    summary,
+    step1RangeStartMs,
+    step1RangeEndMs,
+    step1RangeStartSec,
+    step1RangeEndSec,
+    step1MimirHours,
+  } = resolvedStep1;
+  appendRunLog("RUN", "Region Step2/Step3 processing started", {
+    region: activeRegion,
+    impactedEnvCount: summary.impactedEnvs.length,
+  });
+
   const step2RangeStartNs = step1RangeStartSec * 1e9;
   const step2RangeEndNs = step1RangeEndSec * 1e9;
-  const STEP2_LOKI_HOURS = STEP1_MIMIR_HOURS;
+  const STEP2_LOKI_HOURS = step1MimirHours;
   const lokiByEnv = await collectDecision404LogsByEnv(summary.impactedEnvs, {
     hours: STEP2_LOKI_HOURS,
     limit: 3000,
     startNs: step2RangeStartNs,
     endNs: step2RangeEndNs,
+    regionContext: activeRegion,
   });
 
   console.log("Step 2 complete.");
@@ -4495,7 +6190,7 @@ async function runDecision404AnalysisForRegion(region) {
   );
   const step2Summary = buildStep2CompactSummary(lokiByEnv);
   appendRunLog("STEP2", "Loki 404 request collection completed", {
-    region: ACTIVE_REGION,
+    region: activeRegion,
     envCount: Object.keys(step2Summary || {}).length,
   });
   console.log("Step 2 summary:", step2Summary);
@@ -4505,27 +6200,51 @@ async function runDecision404AnalysisForRegion(region) {
   const step3_1SummaryByEnv = summarizeStep3_1Validation(step3_1ValidationByEnv);
   const step3_2ByEnv = await buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, {
     lookbackHours: 1,
+    regionContext: activeRegion,
   });
   const step3_2SummaryByEnv = summarizeStep3_2PreviousLog(step3_2ByEnv);
-  const step3_3ByEnv = await buildStep3_3CacheLoadingByEnv(step3_2ByEnv);
+  const step3_3ByEnv = await buildStep3_3CacheLoadingByEnv(step3_2ByEnv, {
+    regionContext: activeRegion,
+    envProgressTracker,
+  });
   const step3_3SummaryByEnv = summarizeStep3_3CacheLoading(step3_3ByEnv);
   const step3_3FailureErrorToEnvMap = buildStep3_3FailureErrorToEnvMap(step3_3ByEnv);
   const authzVersionByEnv = {};
   const step3_4Result = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, authzVersionByEnv, {
     step2ByEnv: lokiByEnv,
   });
+  await runMandatoryFurtherAnalysisLokiChecks(step3_4Result, {
+    regionContext: activeRegion,
+  });
   const step3_4Summary = summarizeStep3_4(step3_4Result);
+  const step3_5RecoveryByEnv = await evaluateRecoveryStatusByEnv(step3ParsedByEnv, {
+    regionContext: activeRegion,
+  });
   const step3_4SummaryByEnvTable = buildStep3_4SummaryByEnvTable(
     step3_4Result,
     step2Summary,
     step3_3ByEnv,
+    step3_5RecoveryByEnv,
   );
   const step3Summary = summarizeStep3Records(step3ParsedByEnv);
   appendRunLog("STEP3.4", "Step 3.4 aggregation completed", {
-    region: ACTIVE_REGION,
+    region: activeRegion,
     rootCauseCount: step3_4Summary.rootCauseCount,
     furtherAnalysisCount: step3_4Summary.furtherAnalysisCount,
     summaryByEnvRows: step3_4SummaryByEnvTable.length,
+  });
+  appendRunLog("STEP3.5", "Step 3.5 recovery check completed", {
+    region: activeRegion,
+    envCount: Object.keys(step3_5RecoveryByEnv || {}).length,
+    recoveredEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
+      x => String(x?.recoveryStatus || "") === "recovered",
+    ).length,
+    notRecoveredEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
+      x => String(x?.recoveryStatus || "") === "not_recovered",
+    ).length,
+    notSureEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
+      x => String(x?.recoveryStatus || "") === "not_sure",
+    ).length,
   });
 
   console.log("Step 3.1 complete.");
@@ -4545,12 +6264,12 @@ async function runDecision404AnalysisForRegion(region) {
   console.log("Step 3 summary:", step3Summary);
 
   return {
-    region: ACTIVE_REGION,
+    region: activeRegion,
     impactedEnvs: summary.impactedEnvs,
     rootCauseCount: step3_4Summary.rootCauseCount,
     furtherAnalysisCount: step3_4Summary.furtherAnalysisCount,
-    summaryRows: (step3_4SummaryByEnvTable || []).map(r => ({ region: ACTIVE_REGION, ...r })),
-    furtherRows: (step3_4Result.furtherAnalysisTable || []).map(r => ({ region: ACTIVE_REGION, ...r })),
+    summaryRows: (step3_4SummaryByEnvTable || []).map(r => ({ region: activeRegion, ...r })),
+    furtherRows: (step3_4Result.furtherAnalysisTable || []).map(r => ({ region: activeRegion, ...r })),
   };
 }
 
@@ -4562,9 +6281,12 @@ if (typeof window !== "undefined") {
         ? ALL_REGIONS
         : ANALYSIS_CONFIG.regionsToRun;
       const regions = [...new Set((requestedRegions || []).filter(Boolean))];
+      const maxParallelEnvs = getMaxParallelEnvs();
       appendRunLog("RUN", "Region plan determined", {
         iterateAllRegions: Boolean(ANALYSIS_CONFIG.iterateAllRegions),
         regionCount: regions.length,
+        maxParallelRegions: 1,
+        maxParallelEnvs,
         regions,
       });
 
@@ -4573,28 +6295,86 @@ if (typeof window !== "undefined") {
       const allImpactedEnvs = new Set();
       let totalRootCauseCount = 0;
       let totalFurtherAnalysisCount = 0;
+      const envProgressTracker = createEnvProgressTracker();
+      const step1ByRegion = new Map();
 
-      for (let i = 0; i < regions.length; i += 1) {
+      appendRunLog("RUN", "Step1 pre-discovery started", {
+        regionCount: regions.length,
+        maxParallelRegions: 1,
+      });
+      const step1Results = await mapWithConcurrency(regions, 1, async (region, idx) => {
+        const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
+        if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
+        return runStep1ForRegion(region);
+      });
+
+      for (let i = 0; i < step1Results.length; i += 1) {
         const region = regions[i];
-        try {
-          const res = await runDecision404AnalysisForRegion(region);
+        const step1Run = step1Results[i];
+        if (step1Run?.status === "fulfilled") {
+          const res = step1Run.value;
+          step1ByRegion.set(region, res);
+          for (const env of res?.summary?.impactedEnvs || []) allImpactedEnvs.add(env);
+          continue;
+        }
+
+        const step1Err = step1Run?.reason;
+        appendRunLog("RUN", "Region Step1 failed; region will be skipped", {
+          region,
+          error: String(step1Err?.message || step1Err),
+        });
+        console.error(`Region Step1 failed region=${region}:`, step1Err);
+      }
+
+      for (const region of regions) {
+        const step1 = step1ByRegion.get(region);
+        if (!step1) continue;
+        const p = envProgressTracker.registerRegion(region, step1.summary.impactedEnvs.length);
+        appendRunLog("RUN", "Global env progress registered for region", {
+          region,
+          regionImpactedEnvCount: step1.summary.impactedEnvs.length,
+          processedEnvCount: p.processedEnvCount,
+          totalEnvCount: p.totalEnvCount,
+          progressPct: p.progressPct,
+        });
+      }
+
+      const finalizedProgress = envProgressTracker.getProgress();
+      appendRunLog("RUN", "Global env total finalized before Step2/Step3", {
+        processedEnvCount: finalizedProgress.processedEnvCount,
+        totalEnvCount: finalizedProgress.totalEnvCount,
+        progressPct: finalizedProgress.progressPct,
+        regionsWithStep1Success: step1ByRegion.size,
+      });
+
+      const regionsForAnalysis = regions.filter(region => step1ByRegion.has(region));
+      const regionResults = await mapWithConcurrency(regionsForAnalysis, 1, async (region, idx) => {
+        const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
+        if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
+        return runDecision404AnalysisForRegion(region, {
+          envProgressTracker,
+          step1Result: step1ByRegion.get(region),
+        });
+      });
+
+      for (let i = 0; i < regionResults.length; i += 1) {
+        const region = regionsForAnalysis[i];
+        const runResult = regionResults[i];
+        if (runResult?.status === "fulfilled") {
+          const res = runResult.value;
           totalRootCauseCount += Number(res?.rootCauseCount || 0);
           totalFurtherAnalysisCount += Number(res?.furtherAnalysisCount || 0);
-          for (const env of res?.impactedEnvs || []) allImpactedEnvs.add(env);
           allSummaryRows.push(...(res?.summaryRows || []));
           allFurtherRows.push(...(res?.furtherRows || []));
-        } catch (regionErr) {
-          appendRunLog("RUN", "Region analysis failed; continue with next region", {
-            region,
-            error: String(regionErr?.message || regionErr),
-          });
-          console.error(`Region analysis failed region=${region}:`, regionErr);
+          continue;
         }
 
-        if (i < regions.length - 1) {
-          const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
-          if (waitMs > 0) await sleepMs(waitMs);
-        }
+        const regionErr = runResult?.reason;
+        appendRunLog("RUN", "Region analysis failed; continue with next region", {
+          region,
+          error: String(regionErr?.message || regionErr),
+        });
+        console.error(`Region analysis failed region=${region}:`, regionErr);
       }
 
       try {
@@ -4645,6 +6425,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     buildRequestIdentityKey,
     dedupeDecision404Records,
+    subtractNsWithPrecisionGuard,
     parseElapsedTimeMs,
     isValidDecision404Url,
     isValidStep3_1Message,
@@ -4652,6 +6433,7 @@ if (typeof module !== "undefined" && module.exports) {
     extractRequestedDeploymentFromUrl,
     analyzeStep3_3ForLink,
     buildStep3_4DeploymentCacheCheck,
+    runMandatoryFurtherAnalysisLokiChecks,
     buildStep3_4SummaryByEnvTable,
   };
 }
