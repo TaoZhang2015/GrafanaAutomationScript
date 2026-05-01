@@ -14,6 +14,7 @@ const RUN_LOG_LINES = [];
 let LOKI_QUERY_SEQ = 0;
 let LAST_API_CALL_AT_MS = 0;
 let ACTIVE_STEP_WINDOW_OVERRIDE_HOURS = null;
+const STEP3_TIMELINE_BUILD_COUNT_BY_CACHE_KEY = new Map();
 
 // Frequently changed runtime settings
 const ANALYSIS_CONFIG = {
@@ -22,14 +23,15 @@ const ANALYSIS_CONFIG = {
   regionsToRun: ["phx"],
   maxParallelRegions: 4,
   maxParallelEnvs: 4,
-  throttleBetweenRegionsMs: 400,
+  throttleBetweenRegionsMs: 100,
   grafanaApiMinIntervalMs: 120,
   grafanaRetryMaxAttempts: 3,
   grafanaRetryBaseDelayMs: 300,
-  step1RangeStartPst: "2026-04-27T00:00:00-00:00",
-  step1RangeEndPst: "2026-04-27T23:59:59-00:00",
+  step1RangeStartPst: "2026-04-26T00:00:00-00:00",
+  step1RangeEndPst: "2026-04-26T01:59:59-00:00",
   step1MaxIntervalHours: 6,
   step3_3ReuseWindowMinutes: 10,
+  step3_3ReuseWindowSeconds: 10,
   step3_3CompletionExtend1Minutes: 15,
   step3_3CompletionExtend2Minutes: 30,
   step2AutoSplitOnLimit: true,
@@ -43,6 +45,8 @@ const ANALYSIS_CONFIG = {
   step3_3RepeatedLinkIdentityWarnThreshold: 2,
   step3_3FastTimelineEnabled: true,
   step3_3FastTimelineMinRequestsPerHour: 100,
+  step3_3CacheOnlyMode: true,
+  step3_3CacheWindowMinutes: 10,
 };
 
 const ALL_REGIONS = [
@@ -114,6 +118,11 @@ let ACTIVE_REGION = ANALYSIS_CONFIG.activeRegion;
 
 function getMaxParallelEnvs() {
   const configured = ANALYSIS_CONFIG.maxParallelEnvs ?? ANALYSIS_CONFIG.maxParallelRegions ?? 4;
+  return Math.min(4, Math.max(1, Math.floor(Number(configured) || 4)));
+}
+
+function getMaxParallelRegions() {
+  const configured = ANALYSIS_CONFIG.maxParallelRegions ?? ANALYSIS_CONFIG.maxParallelEnvs ?? 4;
   return Math.min(4, Math.max(1, Math.floor(Number(configured) || 4)));
 }
 
@@ -3243,14 +3252,99 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
   let completionDistinctUsedAll = completionDistinctOriginalAll;
   let completionDistinctUsedTop3 = completionDistinctOriginalTop3;
   let completionExtensionUsed = false;
+  let completionUsedPreviousRound = false;
+  const previousRoundCompletionCheck = {
+    checked: false,
+    reason: "not_required",
+    previousRoundStartNs: null,
+    previousRoundEndNs: null,
+    previousRoundDistinctCount: 0,
+    previousRoundContainsTarget: false,
+    usedAsCompletionEvidence: false,
+    error: null,
+  };
   let completionWindowEndNs = endNs;
+  let shouldRunPostRequestExtension = false;
   if (completionDistinctOriginalTop3.length < 3) {
-    return {
-      fastPathFallbackRequired: true,
-      fallbackReason: "need_previous_round_check_for_insufficient_completion_in_current_round",
-      window: { startNs: String(startNs), endNs: String(endNs) },
-      completionDistinctOriginalCount: completionDistinctOriginalTop3.length,
-    };
+    previousRoundCompletionCheck.checked = true;
+    const previousRoundEndNs = subtractNsWithPrecisionGuard(startNs, 1);
+    const previousRoundStartRec = findLastCachePrepStartBeforeTs(podTimeline, startNs);
+    const previousRoundStartNs = Number(previousRoundStartRec?.lokiTsNs || 0);
+    if (
+      Number.isFinite(previousRoundStartNs) &&
+      previousRoundStartNs > 0 &&
+      previousRoundStartNs < previousRoundEndNs
+    ) {
+      previousRoundCompletionCheck.reason = "checked";
+      previousRoundCompletionCheck.previousRoundStartNs = String(previousRoundStartNs);
+      previousRoundCompletionCheck.previousRoundEndNs = String(previousRoundEndNs);
+      const previousRoundCandidates = completionRecords.filter(r => {
+        const ts = Number(r?.lokiTsNs || 0);
+        return Number.isFinite(ts) && ts >= previousRoundStartNs && ts <= previousRoundEndNs;
+      });
+      const previousRoundMatched = previousRoundCandidates.filter(r =>
+        completionMatchesStartRound(r, previousRoundStartNs),
+      );
+      const previousRoundDistinctAll = distinctCompletionByDeploymentForFast(previousRoundMatched);
+      const previousRoundDistinctTop3 = previousRoundDistinctAll.slice(0, 3);
+      const previousRoundContainsTarget = Boolean(
+        targetDeploymentID &&
+          previousRoundDistinctTop3.some(x => String(x?.deploymentID || "") === String(targetDeploymentID || "")),
+      );
+      previousRoundCompletionCheck.previousRoundDistinctCount = previousRoundDistinctTop3.length;
+      previousRoundCompletionCheck.previousRoundContainsTarget = previousRoundContainsTarget;
+      if (previousRoundDistinctTop3.length >= 3 && previousRoundContainsTarget) {
+        completionUsedPreviousRound = true;
+        previousRoundCompletionCheck.usedAsCompletionEvidence = true;
+        completionCandidates = previousRoundCandidates;
+        completionRoundMatched = previousRoundMatched;
+        completionDistinctUsedAll = previousRoundDistinctAll;
+        completionDistinctUsedTop3 = previousRoundDistinctTop3;
+        completionWindowEndNs = previousRoundEndNs;
+      } else if (previousRoundDistinctTop3.length >= 3 && !previousRoundContainsTarget) {
+        shouldRunPostRequestExtension = true;
+      } else {
+        previousRoundCompletionCheck.reason = "previous_round_distinct_lt_3";
+      }
+    } else {
+      previousRoundCompletionCheck.reason = "previous_round_anchor_not_found";
+    }
+  }
+
+  if (shouldRunPostRequestExtension) {
+    completionExtensionUsed = true;
+    const postExtend1Minutes = Math.max(1, Number(ANALYSIS_CONFIG.step3_3CompletionExtend1Minutes || 15));
+    const postExtend2Minutes = Math.max(
+      postExtend1Minutes,
+      Number(ANALYSIS_CONFIG.step3_3CompletionExtend2Minutes || 30),
+    );
+    const postWindow1StartNs = Math.floor(reqTsNs);
+    const postWindow1EndNs = Math.floor(reqTsNs + postExtend1Minutes * 60 * 1e9);
+    completionWindowEndNs = postWindow1EndNs;
+    let completionCandidatesPostUsed = completionRecords.filter(r => {
+      const ts = Number(r?.lokiTsNs || 0);
+      return Number.isFinite(ts) && ts >= startNs && ts <= postWindow1EndNs;
+    });
+    let completionRoundMatchedPostUsed = completionCandidatesPostUsed.filter(r =>
+      completionMatchesStartRound(r, startNs),
+    );
+
+    if (distinctCompletionByDeploymentForFast(completionRoundMatchedPostUsed).length < 3) {
+      const postWindow2EndNs = Math.floor(reqTsNs + postExtend2Minutes * 60 * 1e9);
+      completionWindowEndNs = postWindow2EndNs;
+      completionCandidatesPostUsed = completionRecords.filter(r => {
+        const ts = Number(r?.lokiTsNs || 0);
+        return Number.isFinite(ts) && ts >= startNs && ts <= postWindow2EndNs;
+      });
+      completionRoundMatchedPostUsed = completionCandidatesPostUsed.filter(r =>
+        completionMatchesStartRound(r, startNs),
+      );
+    }
+
+    completionCandidates = completionCandidatesPostUsed;
+    completionRoundMatched = completionRoundMatchedPostUsed;
+    completionDistinctUsedAll = distinctCompletionByDeploymentForFast(completionRoundMatched);
+    completionDistinctUsedTop3 = completionDistinctUsedAll.slice(0, 3);
   }
   const earliestCompletionMatch =
     completionDistinctUsedAll.find(x => String(x?.deploymentID || "") === String(targetDeploymentID || "")) || null;
@@ -3264,54 +3358,16 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
     x => String(x?.deploymentID || "") === String(targetDeploymentID || ""),
   );
 
-  const restartEntries = (podTimeline?.restartEntries || []).filter(r => {
-    const ts = Number(r?.lokiTsNs || 0);
-    return Number.isFinite(ts) && ts >= startNs && ts <= endNs;
-  });
-  const timelineFailureRecords = (podTimeline?.failureRecords || []).filter(r => {
-    const ts = Number(r?.lokiTsNs || 0);
-    if (!Number.isFinite(ts) || ts < startNs || ts > endNs) return false;
-    const lineTraceID = String(r?.traceID || "").trim();
-    const requestTraceID = String(link?.request?.traceID || "").trim();
-    if (requestTraceID && lineTraceID && lineTraceID === requestTraceID) return false;
-    return true;
-  });
-  const timelineFailureMap = new Map();
-  for (const r of timelineFailureRecords) {
-    const key = String(r?.key || "").trim();
-    const display = String(r?.display || "").trim();
-    if (!key || !display) continue;
-    if (!timelineFailureMap.has(key) || display.length < String(timelineFailureMap.get(key) || "").length) {
-      timelineFailureMap.set(key, display);
-    }
-  }
-  const timelineUniqueFailureErrors = pruneContainingLongerMessages([...timelineFailureMap.values()]);
   const restartEvidence = {
-    count: restartEntries.length,
-    entries: restartEntries.slice(0, 20),
+    count: 0,
+    entries: [],
     query: podTimeline?.decisionTimelineExpr || null,
   };
 
-  let conclusion = null;
+  let conclusion = "cache_load_unknown";
   let reason = null;
   if (completionDistinctUsedTop3.length >= 3) {
-    if (timelineUniqueFailureErrors.length > 0) {
-      conclusion = "cache_load_failure";
-      reason = "failure_evidence_in_timeline_window";
-    } else {
-      return {
-        fastPathFallbackRequired: true,
-        fallbackReason: "timeline_failure_evidence_missing_for_completed_round",
-        window: { startNs: String(startNs), endNs: String(endNs) },
-        completionDistinctExtendCount: completionDistinctUsedTop3.length,
-        failureEvidenceCount: 0,
-      };
-    }
-  } else if (restartEntries.length >= 1) {
-    conclusion = "cache_load_failure";
-    reason = "restart_warmup";
-  } else {
-    return null;
+    conclusion = "cache_load_success";
   }
 
   const deploymentStateCheck = evaluateDeploymentStateFromTimeline({
@@ -3368,7 +3424,7 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
     deploymentStateCheck,
     completionWindowEndNs: String(completionWindowEndNs),
     completionExtensionUsed,
-    completionUsedPreviousRound,
+    completionUsedPreviousRound: Boolean(completionUsedPreviousRound),
     previousRoundCompletionCheck,
     completionFoundAfterOriginalWindow,
     completionCandidatesCount: completionCandidates.length,
@@ -3382,9 +3438,9 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
       deltaSec: null,
       toleranceSec: null,
     },
-    failureEvidenceCount: timelineUniqueFailureErrors.length,
-    failureEvidence: timelineUniqueFailureErrors.slice(0, 20),
-    uniqueFailureErrors: timelineUniqueFailureErrors,
+    failureEvidenceCount: 0,
+    failureEvidence: [],
+    uniqueFailureErrors: [],
     restartEvidence,
     fastPathTimelineUsed: true,
   };
@@ -3393,7 +3449,12 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
 
 async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = {}) {
   const byEnv = new Map();
-  const decisionTimelinePattern = `${LOG_PATTERNS.cachePrepStart}|${LOG_PATTERNS.runtimeCompletion}|${LOG_PATTERNS.deploymentListAny}|starting decision server|starting authz decision server`;
+  const windowMinutes = Math.max(1, Number(ANALYSIS_CONFIG.step3_3CacheWindowMinutes || 10));
+  const decisionTimelinePattern = `${LOG_PATTERNS.cachePrepStart}|${LOG_PATTERNS.runtimeCompletion}|${LOG_PATTERNS.deploymentListAny}`;
+  let totalDecisionTimelineQueryCount = 0;
+  let totalManagementTimelineQueryCount = 0;
+  let totalRebuiltCacheKeyCount = 0;
+  let totalPodTimelineCount = 0;
 
   for (const [env, item] of Object.entries(step3_2ByEnv || {})) {
     const links = item?.links || [];
@@ -3413,15 +3474,30 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
     if (!Number.isFinite(minReqTs) || !Number.isFinite(maxReqTs)) continue;
 
     const podTimelines = new Map();
+    let envDecisionTimelineQueryCount = 0;
+    let envRebuiltCacheKeyCount = 0;
     for (const [pod, reqList] of podToReqTs.entries()) {
+      const cacheKey = `${env}|${pod}`;
+      const builtCount = Number(STEP3_TIMELINE_BUILD_COUNT_BY_CACHE_KEY.get(cacheKey) || 0) + 1;
+      STEP3_TIMELINE_BUILD_COUNT_BY_CACHE_KEY.set(cacheKey, builtCount);
+      if (builtCount > 1) {
+        envRebuiltCacheKeyCount += 1;
+        appendRunLog("STEP3.TL", "warning: moving-window cache key rebuilt", {
+          cacheKey,
+          env,
+          pod,
+          builtCount,
+          reason: "same_env_pod_timeline_rebuilt",
+        });
+      }
       let podMin = reqList[0];
       let podMax = reqList[0];
       for (let i = 1; i < reqList.length; i += 1) {
         if (reqList[i] < podMin) podMin = reqList[i];
         if (reqList[i] > podMax) podMax = reqList[i];
       }
-      const startNs = Math.max(0, Math.floor(podMin - 10 * 60 * 1e9));
-      const endNs = Math.floor(podMax + 30 * 60 * 1e9);
+      const startNs = Math.max(0, Math.floor(podMin - windowMinutes * 60 * 1e9));
+      const endNs = Math.floor(podMax + windowMinutes * 60 * 1e9);
       const decisionTimelineExpr =
         `${buildDecisionSelector(env, pod)}` +
         ` != "/live" != "/ready" |~ "${decisionTimelinePattern}"`;
@@ -3436,14 +3512,14 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
         logStep: "STEP3.TL",
         logContext: { env, pod, timeline: "decision" },
       });
+      envDecisionTimelineQueryCount += 1;
+      totalDecisionTimelineQueryCount += 1;
+      totalPodTimelineCount += 1;
       const cachePrepStarts = [];
       const completionRecords = [];
       const deploymentListRecords = [];
       const defaultDeploymentEvents = [];
-      const restartEntries = [];
-      const failureRecords = [];
       for (const e of entries) {
-        const parsedObj = extractJsonObjectFromLogLine(e.line);
         const recStart = parseCachePrepStartRecord(e.line, e.lokiTsNs);
         if (
           recStart &&
@@ -3458,45 +3534,17 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
           deploymentListRecords.push(recList);
           if (recList.kind === "default") defaultDeploymentEvents.push(recList);
         }
-        const failureRec = extractErrorRecordFromParsedLogObject(parsedObj);
-        if (failureRec) {
-          failureRecords.push({
-            lokiTsNs: e.lokiTsNs,
-            key: failureRec.key,
-            display: failureRec.display,
-            traceID: String(
-              parsedObj?.traceID ?? parsedObj?.traceId ?? parsedObj?.trace_id ?? "",
-            ).trim() || null,
-            timestamp: parsedObj?.timestamp ? String(parsedObj.timestamp) : null,
-            message: parsedObj?.message ? String(parsedObj.message) : null,
-            error: parsedObj?.error ? String(parsedObj.error) : null,
-            line: e.line,
-          });
-        }
-        const msg = String(parsedObj?.message || e.line || "").toLowerCase();
-        if (
-          msg.includes("starting decision server") ||
-          msg.includes("starting authz decision server")
-        ) {
-          restartEntries.push({
-            lokiTsNs: e.lokiTsNs,
-            timestamp: parsedObj?.timestamp || null,
-            message: parsedObj?.message || null,
-            line: e.line,
-          });
-        }
       }
       cachePrepStarts.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       completionRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       deploymentListRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       defaultDeploymentEvents.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
-      restartEntries.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
-      failureRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       const deploymentListRounds = buildDeploymentListCacheRounds(deploymentListRecords);
       const deploymentListRoundsChrono = [...deploymentListRounds].sort(
         (a, b) => Number(a?.startLokiTsNs || 0) - Number(b?.startLokiTsNs || 0),
       );
       podTimelines.set(pod, {
+        cacheKey,
         pod,
         startNs,
         endNs,
@@ -3507,25 +3555,23 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
         deploymentListRounds,
         deploymentListRoundsChrono,
         defaultDeploymentEvents,
-        restartEntries,
-        failureRecords,
       });
       appendRunLog("STEP3.TL", "decision timeline built", {
+        cacheKey,
         env,
         pod,
         startNs: String(startNs),
         endNs: String(endNs),
+        windowMinutes,
         cachePrepStartCount: cachePrepStarts.length,
         completionCount: completionRecords.length,
         deploymentListRecordCount: deploymentListRecords.length,
         deploymentListRoundCount: deploymentListRounds.length,
-        restartCount: restartEntries.length,
-        failureRecordCount: failureRecords.length,
       });
     }
 
-    const mgmtStartNs = Math.max(0, Math.floor(minReqTs - 10 * 60 * 1e9));
-    const mgmtEndNs = Math.floor(maxReqTs + 10 * 60 * 1e9);
+    const mgmtStartNs = Math.max(0, Math.floor(minReqTs - windowMinutes * 60 * 1e9));
+    const mgmtEndNs = Math.floor(maxReqTs + windowMinutes * 60 * 1e9);
     const managementTimelineExpr =
       `{ container=~"management", namespace="authz", prd_env="${env}" }` +
       ` != "/live" != "/ready" |~ "update deployment state successfully"`;
@@ -3540,6 +3586,7 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       logStep: "STEP3.TL",
       logContext: { env, timeline: "management" },
     });
+    totalManagementTimelineQueryCount += 1;
     const managementStateRecords = [];
     for (const e of mgmtEntries) {
       const rec = parseDeploymentStateUpdateRecord(e.line, e.lokiTsNs);
@@ -3547,21 +3594,65 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       managementStateRecords.push(rec);
     }
     managementStateRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+    const linksWithPodAndTs = links.filter(link => {
+      const pod = String(link?.request?.pod || "").trim();
+      const reqTsNs = Number(link?.request?.lokiTsNs);
+      return pod && Number.isFinite(reqTsNs) && reqTsNs > 0;
+    }).length;
+    const linksCoveredByPodTimeline = links.filter(link => {
+      const pod = String(link?.request?.pod || "").trim();
+      const reqTsNs = Number(link?.request?.lokiTsNs);
+      if (!pod || !Number.isFinite(reqTsNs) || reqTsNs <= 0) return false;
+      return podTimelines.has(pod);
+    }).length;
+    const coveragePct =
+      linksWithPodAndTs > 0
+        ? Number(((linksCoveredByPodTimeline / linksWithPodAndTs) * 100).toFixed(2))
+        : 0;
+    const timelineBuildStats = {
+      windowMinutes,
+      dedupedLinkCount: links.length,
+      podCount: podToReqTs.size,
+      decisionTimelineQueryCount: envDecisionTimelineQueryCount,
+      managementTimelineQueryCount: 1,
+      rebuiltCacheKeyCount: envRebuiltCacheKeyCount,
+      linksWithPodAndTs,
+      linksCoveredByPodTimeline,
+      linkCoveragePct: coveragePct,
+      requestSpanMinutes: Number((((maxReqTs - minReqTs) / 60e9) || 0).toFixed(3)),
+    };
     byEnv.set(env, {
       env,
       podTimelines,
       managementTimelineExpr,
       managementStateRecords,
       managementStateIndexByDeployment: buildDeploymentStateIndexByDeployment(managementStateRecords),
+      timelineBuildStats,
     });
+    totalRebuiltCacheKeyCount += envRebuiltCacheKeyCount;
     appendRunLog("STEP3.TL", "management timeline built", {
       env,
       startNs: String(mgmtStartNs),
       endNs: String(mgmtEndNs),
+      windowMinutes,
       deploymentStateRecordCount: managementStateRecords.length,
       deploymentStateDeploymentCount: byEnv.get(env).managementStateIndexByDeployment.size,
+      decisionTimelineQueryCount: envDecisionTimelineQueryCount,
+      rebuiltCacheKeyCount: envRebuiltCacheKeyCount,
+      linkCoveragePct: coveragePct,
+    });
+    appendRunLog("STEP3.TL", "moving-window cache build summary for env", {
+      env,
+      ...timelineBuildStats,
     });
   }
+  appendRunLog("STEP3.TL", "moving-window cache build summary (all envs)", {
+    envCount: byEnv.size,
+    totalPodTimelineCount,
+    totalDecisionTimelineQueryCount,
+    totalManagementTimelineQueryCount,
+    totalRebuiltCacheKeyCount,
+  });
   return byEnv;
 }
 
@@ -4660,17 +4751,22 @@ async function buildStep3_3CacheLoadingByEnv(
 ) {
   const byEnv = {};
   const fastTimelineEnabled = ANALYSIS_CONFIG.step3_3FastTimelineEnabled !== false;
+  const cacheOnlyMode = ANALYSIS_CONFIG.step3_3CacheOnlyMode !== false;
   const fastTimelineMinRequestsPerHour = Math.max(
     0,
     Number(ANALYSIS_CONFIG.step3_3FastTimelineMinRequestsPerHour || 100),
   );
+  const reuseWindowSeconds = Math.max(0, Number(ANALYSIS_CONFIG.step3_3ReuseWindowSeconds ?? 10));
+  const reuseWindowNs = reuseWindowSeconds * 1e9;
   const stepWindowHours = getConfiguredStepWindowHours();
   const fastTimelineDecisionByEnv = new Map();
   const step3_2ByEnvForTimeline = {};
   for (const [env, item] of Object.entries(step3_2ByEnv || {})) {
     const requestRecordCount = Number(item?.requestRecordCount || 0);
     const requestsPerHour = requestRecordCount / stepWindowHours;
-    const eligible = fastTimelineEnabled && requestsPerHour >= fastTimelineMinRequestsPerHour;
+    const eligible = cacheOnlyMode
+      ? fastTimelineEnabled && requestRecordCount > 0
+      : fastTimelineEnabled && requestsPerHour >= fastTimelineMinRequestsPerHour;
     fastTimelineDecisionByEnv.set(env, {
       enabled: eligible,
       requestRecordCount,
@@ -4701,6 +4797,7 @@ async function buildStep3_3CacheLoadingByEnv(
     const conclusionCounts = {};
     const traceSeenCounts = new Map();
     const linkIdentitySeenCounts = new Map();
+    const traceReuseCache = new Map();
     const timelineDecision = fastTimelineDecisionByEnv.get(env) || {
       enabled: false,
       requestRecordCount: Number(item?.requestRecordCount || 0),
@@ -4710,20 +4807,33 @@ async function buildStep3_3CacheLoadingByEnv(
     const envTimeline = timelineDecision.enabled ? fastTimelineByEnv.get(env) || null : null;
     let fastPathUsedCount = 0;
     let deepAnalysisCount = 0;
+    let reusedResultCount = 0;
+    let timelineLookupAttemptCount = 0;
+    let timelineLookupMissCount = 0;
+    let fastPathFallbackCount = 0;
+    let cacheOnlyUnknownCount = 0;
+    let cacheOnlyFallbackUnknownCount = 0;
+    let cacheOnlyNoTimelineMatchCount = 0;
+    let requestTsDirectionSwitchCount = 0;
+    let requestTsIncreasingCount = 0;
+    let requestTsDecreasingCount = 0;
+    let prevReqTsNs = null;
+    let prevReqDirection = 0;
     appendRunLog("STEP3.3", "fast timeline mode decision for env", {
       env,
       region: regionContext || null,
       fastTimelineEnabled: timelineDecision.enabled,
+      cacheOnlyMode,
       fastTimelineMinRequestsPerHour,
       requestRecordCount: timelineDecision.requestRecordCount,
       stepWindowHours: Number(timelineDecision.stepWindowHours.toFixed(4)),
       requestsPerHour: Number(timelineDecision.requestsPerHour.toFixed(4)),
       decisionReason: timelineDecision.enabled ? "high_volume" : "low_volume",
     });
-    appendRunLog("STEP3.3", "reuse logic disabled; force full analysis per link", {
+    appendRunLog("STEP3.3", "reuse logic enabled with strict same-traceID guard", {
       env,
-      fastTimelineEnabled: timelineDecision.enabled,
-      fastTimelineAvailable: Boolean(envTimeline),
+      reuseMode: "same_traceid_only",
+      reuseWindowSeconds,
     });
 
     function buildLinkExactIdentityKey(link) {
@@ -4745,6 +4855,19 @@ async function buildStep3_3CacheLoadingByEnv(
       const reqTsNs = Number(link?.request?.lokiTsNs);
       const reqStartTsNs = Number(link?.request?.requestStartTimeNs);
       const reqTraceID = String(link?.request?.traceID || "");
+      if (Number.isFinite(reqTsNs) && reqTsNs > 0 && Number.isFinite(prevReqTsNs)) {
+        const delta = reqTsNs - prevReqTsNs;
+        const dir = delta > 0 ? 1 : delta < 0 ? -1 : 0;
+        if (dir > 0) requestTsIncreasingCount += 1;
+        if (dir < 0) requestTsDecreasingCount += 1;
+        if (dir !== 0 && prevReqDirection !== 0 && dir !== prevReqDirection) {
+          requestTsDirectionSwitchCount += 1;
+        }
+        if (dir !== 0) prevReqDirection = dir;
+      }
+      if (Number.isFinite(reqTsNs) && reqTsNs > 0) {
+        prevReqTsNs = reqTsNs;
+      }
       const linkSeenCount = (linkIdentitySeenCounts.get(linkExactIdentityKey) || 0) + 1;
       linkIdentitySeenCounts.set(linkExactIdentityKey, linkSeenCount);
 
@@ -4790,12 +4913,48 @@ async function buildStep3_3CacheLoadingByEnv(
       }
 
       let result = null;
+      let reusedFromTraceID = null;
+      let reuseMeta = null;
       let fullAnalysisPerformed = false;
+      let timelineFastPathFallbackForLink = false;
+
+      if (
+        !result &&
+        reqTraceID &&
+        Number.isFinite(reqTsNs) &&
+        reqTsNs > 0 &&
+        traceReuseCache.has(reqTraceID)
+      ) {
+        const cached = traceReuseCache.get(reqTraceID);
+        const cachedTsNs = Number(cached?.reqTsNs);
+        const tsDeltaNs = Number.isFinite(cachedTsNs) ? Math.abs(reqTsNs - cachedTsNs) : Number.POSITIVE_INFINITY;
+        if (tsDeltaNs <= reuseWindowNs && cached?.result) {
+          result = cached.result;
+          reusedResultCount += 1;
+          reusedFromTraceID = reqTraceID;
+          reuseMeta = {
+            mode: "same_traceid_short_window",
+            reuseWindowSeconds,
+            tsDeltaNs: String(Math.floor(tsDeltaNs)),
+          };
+          appendRunLog("STEP3.3", "reused prior result for same traceID in short window", {
+            env,
+            traceID: reqTraceID,
+            requestUrl: reqUrl || null,
+            requestCompleteTimeNs: String(reqTsNs),
+            reuseWindowSeconds,
+            tsDeltaNs: String(Math.floor(tsDeltaNs)),
+          });
+        }
+      }
 
       if (!result && envTimeline) {
+        timelineLookupAttemptCount += 1;
         const fastResult = fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline);
         if (fastResult) {
           if (fastResult.fastPathFallbackRequired) {
+            timelineFastPathFallbackForLink = true;
+            fastPathFallbackCount += 1;
             appendRunLog("STEP3.3", "timeline fast-path fallback to full analysis for link", {
               env,
               traceID: reqTraceID || null,
@@ -4806,6 +4965,48 @@ async function buildStep3_3CacheLoadingByEnv(
               completionDistinctExtendCount:
                 Number(fastResult?.completionDistinctExtendCount || 0),
             });
+            if (cacheOnlyMode) {
+              result = {
+                conclusion: "cache_load_unknown",
+                reason: "cache_only_mode_fastpath_fallback",
+                window: fastResult?.window || null,
+                defaultLookupWindow: null,
+                successfulDeploymentsAll: [],
+                successfulDeploymentsLatestTop3: [],
+                completionDistinctOriginalCount: Number(fastResult?.completionDistinctOriginalCount || 0),
+                completionDistinctExtendCount: Number(fastResult?.completionDistinctExtendCount || 0),
+                targetInOriginalTop3: false,
+                targetInUsedTop3: false,
+                resolvedDefaultDeployment: null,
+                defaultDeploymentCandidates: [],
+                targetDeploymentID: null,
+                deploymentListCacheWindow: null,
+                deploymentListCacheCandidatesCount: 0,
+                deploymentListCacheCandidatesSample: [],
+                deploymentListCacheRoundsCount: 0,
+                deploymentListCacheRoundsLatest2: [],
+                deploymentListCacheCheck: null,
+                deploymentListPostRequestCheck: null,
+                traceErrorSummary: buildFastTraceErrorSummary("unknown"),
+                deploymentStateCheck: null,
+                completionWindowEndNs: null,
+                completionExtensionUsed: false,
+                completionUsedPreviousRound: false,
+                previousRoundCompletionCheck: null,
+                completionFoundAfterOriginalWindow: false,
+                completionCandidatesCount: 0,
+                completionCandidatesSample: [],
+                earliestCompletionMatch: null,
+                completionTiming: null,
+                failureEvidenceCount: 0,
+                failureEvidence: [],
+                uniqueFailureErrors: [],
+                restartEvidence: { count: 0, entries: [], query: null },
+                queries: { timelineMode: true },
+              };
+              cacheOnlyUnknownCount += 1;
+              cacheOnlyFallbackUnknownCount += 1;
+            }
           } else {
             result = fastResult;
             fastPathUsedCount += 1;
@@ -4818,14 +5019,68 @@ async function buildStep3_3CacheLoadingByEnv(
               conclusion: result?.conclusion || null,
             });
           }
+        } else {
+          timelineLookupMissCount += 1;
         }
       }
 
       if (!result) {
-        deepAnalysisCount += 1;
-        fullAnalysisPerformed = true;
-        result = await analyzeStep3_3ForLink(link, {
-          queryLokiFn: (expr, opts = {}) => queryLoki(expr, { ...opts, regionContext }),
+        if (cacheOnlyMode) {
+          result = {
+            conclusion: "cache_load_unknown",
+            reason: "cache_only_mode_no_timeline_match",
+            window: null,
+            defaultLookupWindow: null,
+            successfulDeploymentsAll: [],
+            successfulDeploymentsLatestTop3: [],
+            completionDistinctOriginalCount: 0,
+            completionDistinctExtendCount: 0,
+            targetInOriginalTop3: false,
+            targetInUsedTop3: false,
+            resolvedDefaultDeployment: null,
+            defaultDeploymentCandidates: [],
+            targetDeploymentID: null,
+            deploymentListCacheWindow: null,
+            deploymentListCacheCandidatesCount: 0,
+            deploymentListCacheCandidatesSample: [],
+            deploymentListCacheRoundsCount: 0,
+            deploymentListCacheRoundsLatest2: [],
+            deploymentListCacheCheck: null,
+            deploymentListPostRequestCheck: null,
+            traceErrorSummary: buildFastTraceErrorSummary("unknown"),
+            deploymentStateCheck: null,
+            completionWindowEndNs: null,
+            completionExtensionUsed: false,
+            completionUsedPreviousRound: false,
+            previousRoundCompletionCheck: null,
+            completionFoundAfterOriginalWindow: false,
+            completionCandidatesCount: 0,
+            completionCandidatesSample: [],
+            earliestCompletionMatch: null,
+            completionTiming: null,
+            failureEvidenceCount: 0,
+            failureEvidence: [],
+            uniqueFailureErrors: [],
+            restartEvidence: { count: 0, entries: [], query: null },
+            queries: { timelineMode: true },
+          };
+          cacheOnlyUnknownCount += 1;
+          if (!timelineFastPathFallbackForLink) {
+            cacheOnlyNoTimelineMatchCount += 1;
+          }
+        } else {
+          deepAnalysisCount += 1;
+          fullAnalysisPerformed = true;
+          result = await analyzeStep3_3ForLink(link, {
+            queryLokiFn: (expr, opts = {}) => queryLoki(expr, { ...opts, regionContext }),
+          });
+        }
+      }
+
+      if (reqTraceID && Number.isFinite(reqTsNs) && reqTsNs > 0 && result) {
+        traceReuseCache.set(reqTraceID, {
+          reqTsNs,
+          result,
         });
       }
 
@@ -4878,8 +5133,8 @@ async function buildStep3_3CacheLoadingByEnv(
         uniqueFailureErrors: result.uniqueFailureErrors || [],
         restartEvidence: result.restartEvidence || { count: 0, entries: [], query: null },
         queries: result.queries || null,
-        reusedFromTraceID: null,
-        reuseMeta: null,
+        reusedFromTraceID,
+        reuseMeta,
         fullAnalysisPerformed,
       });
 
@@ -4899,7 +5154,16 @@ async function buildStep3_3CacheLoadingByEnv(
       conclusionCounts,
       fastPathUsedCount,
       deepAnalysisCount,
-      reusedResultCount: 0,
+      reusedResultCount,
+      timelineLookupAttemptCount,
+      timelineLookupMissCount,
+      fastPathFallbackCount,
+      cacheOnlyUnknownCount,
+      cacheOnlyFallbackUnknownCount,
+      cacheOnlyNoTimelineMatchCount,
+      requestTsDirectionSwitchCount,
+      requestTsIncreasingCount,
+      requestTsDecreasingCount,
       links: analyzedLinks,
       failureSamples: analyzedLinks
         .filter(x => x.conclusion === "cache_load_failure")
@@ -4914,11 +5178,37 @@ async function buildStep3_3CacheLoadingByEnv(
       conclusionCounts,
       fastPathUsedCount,
       deepAnalysisCount,
-      reusedResultCount: 0,
+      reusedResultCount,
       fastTimelineEnabled: timelineDecision.enabled,
       fastTimelineMinRequestsPerHour,
       requestsPerHour: Number(timelineDecision.requestsPerHour.toFixed(4)),
       fastTimelineAvailable: Boolean(envTimeline),
+      movingWindowHitCount: fastPathUsedCount + reusedResultCount,
+      movingWindowHitPct:
+        links.length > 0
+          ? Number((((fastPathUsedCount + reusedResultCount) / links.length) * 100).toFixed(2))
+          : 0,
+      movingWindowFastPathHitPct:
+        links.length > 0 ? Number(((fastPathUsedCount / links.length) * 100).toFixed(2)) : 0,
+      movingWindowReuseHitPct:
+        links.length > 0 ? Number(((reusedResultCount / links.length) * 100).toFixed(2)) : 0,
+      timelineLookupAttemptCount,
+      timelineLookupMissCount,
+      fastPathFallbackCount,
+      cacheOnlyUnknownCount,
+      cacheOnlyFallbackUnknownCount,
+      cacheOnlyNoTimelineMatchCount,
+      deepQueryTriggeredCount: deepAnalysisCount,
+      requestTsDirectionSwitchCount,
+      requestTsIncreasingCount,
+      requestTsDecreasingCount,
+      requestTsDirectionSwitchPct:
+        links.length > 1
+          ? Number(
+              ((requestTsDirectionSwitchCount / Math.max(1, links.length - 1)) * 100).toFixed(2),
+            )
+          : 0,
+      timelineBuildStats: envTimeline?.timelineBuildStats || null,
     });
     const progress =
       envProgressTracker && typeof envProgressTracker.markEnvProcessed === "function"
@@ -4935,6 +5225,40 @@ async function buildStep3_3CacheLoadingByEnv(
       totalEnvCount: progress.totalEnvCount,
       progressPct: progress.progressPct,
     });
+
+    const movingWindowCacheCleanup = {
+      env,
+      movingWindowCachePresent: Boolean(envTimeline),
+      podTimelineCountBeforeClear: Number(envTimeline?.podTimelines?.size || 0),
+      managementStateRecordCountBeforeClear: Number(envTimeline?.managementStateRecords?.length || 0),
+      managementDeploymentCountBeforeClear: Number(
+        envTimeline?.managementStateIndexByDeployment?.size || 0,
+      ),
+    };
+    if (envTimeline) {
+      if (envTimeline.podTimelines && typeof envTimeline.podTimelines.clear === "function") {
+        envTimeline.podTimelines.clear();
+      }
+      if (Array.isArray(envTimeline.managementStateRecords)) {
+        envTimeline.managementStateRecords.length = 0;
+      }
+      if (
+        envTimeline.managementStateIndexByDeployment &&
+        typeof envTimeline.managementStateIndexByDeployment.clear === "function"
+      ) {
+        envTimeline.managementStateIndexByDeployment.clear();
+      }
+      fastTimelineByEnv.delete(env);
+    }
+    appendRunLog("STEP3.3", "moving-window cache cleaned for env", {
+      ...movingWindowCacheCleanup,
+      podTimelineCountAfterClear: Number(envTimeline?.podTimelines?.size || 0),
+      managementStateRecordCountAfterClear: Number(envTimeline?.managementStateRecords?.length || 0),
+      managementDeploymentCountAfterClear: Number(
+        envTimeline?.managementStateIndexByDeployment?.size || 0,
+      ),
+      remainingEnvTimelineCacheCount: fastTimelineByEnv.size,
+    });
   }
 
   return byEnv;
@@ -4949,6 +5273,15 @@ function summarizeStep3_3CacheLoading(step3_3ByEnv) {
       fastPathUsedCount: item.fastPathUsedCount || 0,
       deepAnalysisCount: item.deepAnalysisCount || 0,
       reusedResultCount: item.reusedResultCount || 0,
+      timelineLookupAttemptCount: item.timelineLookupAttemptCount || 0,
+      timelineLookupMissCount: item.timelineLookupMissCount || 0,
+      fastPathFallbackCount: item.fastPathFallbackCount || 0,
+      cacheOnlyUnknownCount: item.cacheOnlyUnknownCount || 0,
+      cacheOnlyFallbackUnknownCount: item.cacheOnlyFallbackUnknownCount || 0,
+      cacheOnlyNoTimelineMatchCount: item.cacheOnlyNoTimelineMatchCount || 0,
+      requestTsDirectionSwitchCount: item.requestTsDirectionSwitchCount || 0,
+      requestTsIncreasingCount: item.requestTsIncreasingCount || 0,
+      requestTsDecreasingCount: item.requestTsDecreasingCount || 0,
       conclusionCounts: item.conclusionCounts || {},
     };
   }
@@ -5049,7 +5382,7 @@ function buildStep3_4DeploymentCacheCheck(
 
   const rootCauseTable = [];
   const furtherAnalysisTable = [];
-  const buildFurtherAnalysisIdentityKey = row =>
+  const buildCaseIdentityKey = row =>
     [
       String(row?.env || ""),
       String(row?.traceID || ""),
@@ -5712,36 +6045,83 @@ function buildStep3_4DeploymentCacheCheck(
     });
   }
 
-  const fullAnalysisFurtherAnalysisIdentitySet = new Set();
+  appendRunLog("STEP3.4", "further analysis table kept unfiltered for mandatory per-case checks", {
+    furtherAnalysisRowCount: furtherAnalysisTable.length,
+  });
+
+  const accountedCaseIdentitySet = new Set();
+  for (const row of alignedRootCauseTable) {
+    accountedCaseIdentitySet.add(buildCaseIdentityKey(row));
+  }
+  for (const row of furtherAnalysisTable) {
+    accountedCaseIdentitySet.add(buildCaseIdentityKey(row));
+  }
+  let missingCaseBackfillCount = 0;
   for (const [env, item] of Object.entries(step3_3ByEnv || {})) {
     for (const link of item?.links || []) {
-      if (!Boolean(link?.fullAnalysisPerformed)) continue;
       const request = link?.request || {};
-      fullAnalysisFurtherAnalysisIdentitySet.add(
-        buildFurtherAnalysisIdentityKey({
-          env,
-          traceID: request.traceID || null,
-          requestLokiTsNs: request.lokiTsNs || null,
-          url: request.url || null,
-          pod: request.pod || null,
-        }),
-      );
+      const caseKey = buildCaseIdentityKey({
+        env,
+        traceID: request?.traceID || null,
+        requestLokiTsNs: request?.lokiTsNs || null,
+        url: request?.url || null,
+        pod: request?.pod || null,
+      });
+      if (accountedCaseIdentitySet.has(caseKey)) continue;
+      missingCaseBackfillCount += 1;
+      accountedCaseIdentitySet.add(caseKey);
+      furtherAnalysisTable.push({
+        env,
+        authzVersion: authzVersionByEnv[String(env || "").toLowerCase()] || "N/A",
+        duplicateCount: Number(request?.duplicateCount || 1),
+        traceID: request?.traceID || null,
+        pod: request?.pod || null,
+        requestTimestamp: request?.timestamp || null,
+        requestLokiTsNs: request?.lokiTsNs || null,
+        requestStartTimeNs: request?.requestStartTimeNs || null,
+        requestElapsedTime: request?.elapsedTime || null,
+        requestElapsedTimeMs:
+          Number.isFinite(Number(request?.elapsedTimeMs)) ? Number(request.elapsedTimeMs) : null,
+        requestElapsedTimeRoundedMs:
+          Number.isFinite(Number(request?.elapsedTimeRoundedMs))
+            ? Number(request.elapsedTimeRoundedMs)
+            : null,
+        url: request?.url || null,
+        requestedDeploymentType: extractRequestedDeploymentFromUrl(request?.url).type,
+        requestedDeploymentID: extractRequestedDeploymentFromUrl(request?.url).deploymentID,
+        resolvedDefaultDeploymentID: link?.resolvedDefaultDeployment?.defaultDeploymentID || null,
+        cacheDeploymentListCount: Array.isArray(link?.successfulDeploymentsAll)
+          ? link.successfulDeploymentsAll.length
+          : 0,
+        cacheDeploymentList: Array.isArray(link?.successfulDeploymentsAll)
+          ? link.successfulDeploymentsAll
+              .map(x => String(x?.deploymentID || "").trim())
+              .filter(Boolean)
+          : [],
+        step3_3Conclusion: link?.conclusion || "cache_load_unknown",
+        result: "missing_step3_4_classification_backfilled_for_mandatory_checks",
+        action: "further_analysis_required",
+      });
+      appendRunLog("STEP3.4", "backfilled unclassified case into further analysis table", {
+        env,
+        traceID: request?.traceID || null,
+        pod: request?.pod || null,
+        requestLokiTsNs: request?.lokiTsNs || null,
+        url: request?.url || null,
+        step3_3Conclusion: link?.conclusion || null,
+      });
     }
   }
-  const filteredFurtherAnalysisTable = furtherAnalysisTable.filter(row =>
-    fullAnalysisFurtherAnalysisIdentitySet.has(buildFurtherAnalysisIdentityKey(row)),
-  );
-  if (filteredFurtherAnalysisTable.length !== furtherAnalysisTable.length) {
-    appendRunLog("STEP3.4", "filtered further analysis table to full-analysis links only", {
-      beforeCount: furtherAnalysisTable.length,
-      afterCount: filteredFurtherAnalysisTable.length,
-      removedCount: furtherAnalysisTable.length - filteredFurtherAnalysisTable.length,
+  if (missingCaseBackfillCount > 0) {
+    appendRunLog("STEP3.4", "safety backfill added unclassified cases to further analysis table", {
+      missingCaseBackfillCount,
+      finalFurtherAnalysisRowCount: furtherAnalysisTable.length,
     });
   }
 
   return {
     rootCauseTable: alignedRootCauseTable,
-    furtherAnalysisTable: filteredFurtherAnalysisTable,
+    furtherAnalysisTable,
   };
 }
 
@@ -6262,9 +6642,24 @@ async function runDecision404AnalysisForRegion(
     step1RangeEndSec,
     step1MimirHours,
   } = resolvedStep1;
+  const impactedEnvCount = Array.isArray(summary?.impactedEnvs) ? summary.impactedEnvs.length : 0;
+  if (impactedEnvCount === 0) {
+    appendRunLog("RUN", "Region Step2/Step3 skipped: no impacted envs from Step1", {
+      region: activeRegion,
+      impactedEnvCount: 0,
+    });
+    return {
+      region: activeRegion,
+      impactedEnvs: [],
+      rootCauseCount: 0,
+      furtherAnalysisCount: 0,
+      summaryRows: [],
+      furtherRows: [],
+    };
+  }
   appendRunLog("RUN", "Region Step2/Step3 processing started", {
     region: activeRegion,
-    impactedEnvCount: summary.impactedEnvs.length,
+    impactedEnvCount,
   });
 
   const step2RangeStartNs = step1RangeStartSec * 1e9;
@@ -6388,13 +6783,14 @@ if (typeof window !== "undefined") {
       requestedRegions = ANALYSIS_CONFIG.iterateAllRegions ? ALL_REGIONS : ANALYSIS_CONFIG.regionsToRun;
       regions = [...new Set((requestedRegions || []).filter(Boolean))];
       const maxParallelEnvs = getMaxParallelEnvs();
+      const maxParallelRegions = getMaxParallelRegions();
       const intervalWindows = splitStep1Windows(ANALYSIS_CONFIG.step1MaxIntervalHours || 6);
       appendRunLog("RUN", "Region plan determined", {
         iterateAllRegions: Boolean(ANALYSIS_CONFIG.iterateAllRegions),
         regionCount: regions.length,
         intervalCount: intervalWindows.length,
         maxIntervalHours: Number(ANALYSIS_CONFIG.step1MaxIntervalHours || 6),
-        maxParallelRegions: 1,
+        maxParallelRegions,
         maxParallelEnvs,
         regions,
       });
@@ -6411,6 +6807,9 @@ if (typeof window !== "undefined") {
           furtherRows: [],
           rootCauseCount: 0,
           furtherAnalysisCount: 0,
+          step1FailedRegions: [],
+          analysisFailedRegions: [],
+          isCompleteForExport: false,
         };
         intervalBuckets.push(intervalBucket);
 
@@ -6425,9 +6824,9 @@ if (typeof window !== "undefined") {
         appendRunLog("RUN", "Step1 pre-discovery started", {
           intervalLabel,
           regionCount: regions.length,
-          maxParallelRegions: 1,
+          maxParallelRegions,
         });
-        const step1Results = await mapWithConcurrency(regions, 1, async (region, idx) => {
+        const step1Results = await mapWithConcurrency(regions, maxParallelRegions, async (region, idx) => {
           const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
           if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
           return runStep1ForRegion(region, { step1Window: intervalWindow });
@@ -6444,6 +6843,10 @@ if (typeof window !== "undefined") {
           }
 
           const step1Err = step1Run?.reason;
+          intervalBucket.step1FailedRegions.push({
+            region,
+            error: String(step1Err?.message || step1Err),
+          });
           appendRunLog("RUN", "Region Step1 failed; region will be skipped", {
             intervalLabel,
             region,
@@ -6476,7 +6879,10 @@ if (typeof window !== "undefined") {
         });
 
         const regionsForAnalysis = regions.filter(region => step1ByRegion.has(region));
-        const regionResults = await mapWithConcurrency(regionsForAnalysis, 1, async (region, idx) => {
+        const regionResults = await mapWithConcurrency(
+          regionsForAnalysis,
+          maxParallelRegions,
+          async (region, idx) => {
           const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
           if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
           return runDecision404AnalysisForRegion(region, {
@@ -6484,7 +6890,8 @@ if (typeof window !== "undefined") {
             step1Result: step1ByRegion.get(region),
             step1Window: intervalWindow,
           });
-        });
+          },
+        );
 
         for (let i = 0; i < regionResults.length; i += 1) {
           const region = regionsForAnalysis[i];
@@ -6499,6 +6906,10 @@ if (typeof window !== "undefined") {
           }
 
           const regionErr = runResult?.reason;
+          intervalBucket.analysisFailedRegions.push({
+            region,
+            error: String(regionErr?.message || regionErr),
+          });
           appendRunLog("RUN", "Region analysis failed; continue with next region", {
             intervalLabel,
             region,
@@ -6506,6 +6917,12 @@ if (typeof window !== "undefined") {
           });
           console.error(`Region analysis failed region=${region} interval=${intervalLabel}:`, regionErr);
         }
+
+        intervalBucket.isCompleteForExport =
+          intervalBucket.step1FailedRegions.length === 0 &&
+          intervalBucket.analysisFailedRegions.length === 0 &&
+          step1ByRegion.size === regions.length &&
+          regionResults.length === regions.length;
 
         totalRootCauseCount += intervalBucket.rootCauseCount;
         totalFurtherAnalysisCount += intervalBucket.furtherAnalysisCount;
@@ -6515,6 +6932,9 @@ if (typeof window !== "undefined") {
           furtherAnalysisCount: intervalBucket.furtherAnalysisCount,
           summaryByEnvRows: intervalBucket.summaryRows.length,
           furtherRows: intervalBucket.furtherRows.length,
+          step1FailedRegionCount: intervalBucket.step1FailedRegions.length,
+          analysisFailedRegionCount: intervalBucket.analysisFailedRegions.length,
+          isCompleteForExport: intervalBucket.isCompleteForExport,
         });
       }
     } catch (e) {
@@ -6523,7 +6943,25 @@ if (typeof window !== "undefined") {
     } finally {
       try {
         try {
-          const saveRes = await saveEnvListTxtFromStep1([...allImpactedEnvs], "EnvList.txt");
+          const summaryEnvSet = new Set();
+          for (const bucket of intervalBuckets) {
+            for (const row of bucket.summaryRows || []) {
+              const env = String(row?.env || "").trim();
+              if (env) summaryEnvSet.add(env);
+            }
+          }
+          const envListSorted = [...allImpactedEnvs]
+            .map(x => String(x || "").trim())
+            .filter(Boolean)
+            .sort((a, b) => a.localeCompare(b));
+          const step1OnlyEnvList = envListSorted.filter(env => !summaryEnvSet.has(env));
+          appendRunLog("RUN", "EnvList aggregation summary", {
+            envListUniqueCount: envListSorted.length,
+            summaryUniqueEnvCount: summaryEnvSet.size,
+            step1OnlyEnvCount: step1OnlyEnvList.length,
+            step1OnlyEnvSample: step1OnlyEnvList.slice(0, 20),
+          });
+          const saveRes = await saveEnvListTxtFromStep1(envListSorted, "EnvList.txt");
           console.log("Step 1 EnvList.txt export:", saveRes);
         } catch (e) {
           console.error("Step 1 EnvList.txt export failed:", e);
@@ -6531,6 +6969,15 @@ if (typeof window !== "undefined") {
 
         const csvFiles = [];
         for (const bucket of intervalBuckets) {
+          if (!bucket.isCompleteForExport) {
+            appendRunLog("RUN", "Interval CSV export skipped", {
+              intervalLabel: bucket.label,
+              reason: "interval_not_fully_completed",
+              step1FailedRegionCount: bucket.step1FailedRegions.length,
+              analysisFailedRegionCount: bucket.analysisFailedRegions.length,
+            });
+            continue;
+          }
           csvFiles.push({
             suggestedName: `decision404_summary_by_env_${bucket.label}.csv`,
             content: rowsToCsv(bucket.summaryRows),
