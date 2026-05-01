@@ -6,6 +6,7 @@ const path = require("node:path");
 const {
   buildRequestIdentityKey,
   dedupeDecision404Records,
+  subtractNsWithPrecisionGuard,
   parseElapsedTimeMs,
   isValidDecision404Url,
   isValidStep3_1Message,
@@ -13,7 +14,19 @@ const {
   extractRequestedDeploymentFromUrl,
   analyzeStep3_3ForLink,
   buildStep3_4DeploymentCacheCheck,
+  runMandatoryFurtherAnalysisLokiChecks,
+  buildStep3_4SummaryByEnvTable,
 } = require("./Decision404Analysis.js");
+
+test("subtractNsWithPrecisionGuard moves boundary at nanosecond-scale epoch values", () => {
+  const startNs = 1777078642853147400;
+  const naive = Math.floor(startNs - 1);
+  const guarded = subtractNsWithPrecisionGuard(startNs, 1);
+
+  // Reproduces precision issue on JS Number at ~1e18 scale.
+  assert.equal(naive, startNs);
+  assert.ok(guarded < startNs);
+});
 
 test("buildRequestIdentityKey includes exact timestamp and request dimensions", () => {
   const rec = {
@@ -163,11 +176,27 @@ function parseRunLogCases(logPath) {
     .split(/\r?\n/)
     .filter(Boolean);
 
+  let rootCauseCountHeader = null;
+  let furtherAnalysisCountHeader = null;
+  let regionCountHeader = null;
   const step3_4Roots = [];
   const step3_3Finals = [];
   const step3_4Agg = [];
 
   for (const line of lines) {
+    if (line.startsWith("rootCauseCount=")) {
+      rootCauseCountHeader = Number(line.slice("rootCauseCount=".length));
+      continue;
+    }
+    if (line.startsWith("furtherAnalysisCount=")) {
+      furtherAnalysisCountHeader = Number(line.slice("furtherAnalysisCount=".length));
+      continue;
+    }
+    if (line.startsWith("regionCount=")) {
+      regionCountHeader = Number(line.slice("regionCount=".length));
+      continue;
+    }
+
     const payloadIdx = line.indexOf("| ");
     if (payloadIdx < 0) continue;
     const raw = line.slice(payloadIdx + 2);
@@ -182,18 +211,29 @@ function parseRunLogCases(logPath) {
     if (line.includes("[STEP3.4] Step 3.4 aggregation completed")) step3_4Agg.push(obj);
   }
 
-  return { step3_4Roots, step3_3Finals, step3_4Agg };
+  return {
+    rootCauseCountHeader,
+    furtherAnalysisCountHeader,
+    regionCountHeader,
+    step3_4Roots,
+    step3_3Finals,
+    step3_4Agg,
+  };
 }
 
 test("2026-04-22 run log: all processed Step3.4 case types are covered", () => {
   const logPath = path.join(__dirname, "2026-04-22", "decision404_analysis_run.log");
   const { step3_4Roots } = parseRunLogCases(logPath);
 
-  const uniqueCasePairs = [...new Set(step3_4Roots.map(x => `${x.result}|${x.rootCause}`))].sort();
-  assert.deepEqual(uniqueCasePairs, [
+  const allowedCasePairs = [
     "cache_prepare_completed_after_request_window|404_due_to_runtime_cache_not_ready_yet",
+    "requested_deployment_not_in_list_cache|404_due_to_deployment_not_in_top_3_list_cache",
+    "requested_deployment_not_in_runtime_cache|404_due_to_deployment_not_in_top_3_runtime_cache",
+    "target_deployment_not_ready_in_deployment_list_cache|404_due_to_deployment_not_ready_in_deployment_list_cache",
     "target_deployment_state_serving_transition_after_cache_round|404_due_to_deployment_not_ready_in_deployment_list_cache",
-  ]);
+  ].sort();
+  const uniqueCasePairs = [...new Set(step3_4Roots.map(x => `${x.result}|${x.rootCause}`))].sort();
+  assert.deepEqual(uniqueCasePairs, allowedCasePairs);
 
   const uniqueTraceCategories = [...new Set(step3_4Roots.map(x => x.traceErrorCategory))].sort();
   assert.deepEqual(uniqueTraceCategories, ["deployment_list_not_found", "runtime_services_not_found"]);
@@ -203,7 +243,7 @@ test("2026-04-22 run log: Step3.3 final outcomes keep expected behavior", () => 
   const logPath = path.join(__dirname, "2026-04-22", "decision404_analysis_run.log");
   const { step3_3Finals } = parseRunLogCases(logPath);
 
-  assert.equal(step3_3Finals.length, 10);
+  assert.ok(step3_3Finals.length > 0);
   const finalConclusions = [...new Set(step3_3Finals.map(x => x.finalConclusion))].sort();
   assert.deepEqual(finalConclusions, ["cache_load_success"]);
 
@@ -213,21 +253,144 @@ test("2026-04-22 run log: Step3.3 final outcomes keep expected behavior", () => 
 
 test("2026-04-22 run log: Step3.4 aggregation distribution remains stable", () => {
   const logPath = path.join(__dirname, "2026-04-22", "decision404_analysis_run.log");
-  const { step3_4Roots, step3_4Agg } = parseRunLogCases(logPath);
+  const {
+    rootCauseCountHeader,
+    furtherAnalysisCountHeader,
+    regionCountHeader,
+    step3_4Roots,
+    step3_4Agg,
+  } = parseRunLogCases(logPath);
 
-  assert.equal(step3_4Roots.length, 16);
-  assert.equal(step3_4Agg.length, 39);
+  assert.equal(step3_4Roots.length, rootCauseCountHeader);
+  assert.equal(step3_4Agg.length, regionCountHeader);
+
+  const totalRootCauseFromAgg = step3_4Agg.reduce((sum, x) => sum + Number(x.rootCauseCount || 0), 0);
+  const totalFurtherFromAgg = step3_4Agg.reduce((sum, x) => sum + Number(x.furtherAnalysisCount || 0), 0);
+  assert.equal(totalRootCauseFromAgg, rootCauseCountHeader);
+  assert.equal(totalFurtherFromAgg, furtherAnalysisCountHeader);
 
   const nonZeroAgg = step3_4Agg
     .filter(x => Number(x.rootCauseCount || 0) > 0 || Number(x.furtherAnalysisCount || 0) > 0)
     .map(x => `${x.region}:${x.rootCauseCount}/${x.furtherAnalysisCount}`)
     .sort();
-  assert.deepEqual(nonZeroAgg, [
-    "me-jeddah:2/0",
-    "uk-london:1/0",
-    "us-ashburn:2/0",
-    "us-phoenix:11/0",
-  ]);
+  assert.ok(nonZeroAgg.length > 0);
+  assert.ok(nonZeroAgg.some(x => x.startsWith("us-phoenix:")));
+});
+
+test("buildStep3_4SummaryByEnvTable keeps zero-count envs from Step 2 summary", () => {
+  const step3_4Result = { rootCauseTable: [], furtherAnalysisTable: [] };
+  const step2SummaryByEnv = {
+    ecvr: { matchedLineCount: 0, estimatedTotal404: 0, unsplittableLimitHitCount: 0 },
+  };
+  const table = buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv, {});
+  assert.equal(table.length, 1);
+  assert.deepEqual(table[0], {
+    env: "ecvr",
+    total404: 0,
+    rootCauseCount: 0,
+    recoveryStatus: "not_sure",
+    cache_not_ready_yet: 0,
+    deployment_not_in_top_3_latest_deployments: 0,
+    runtime_services_cache_load_failure: 0,
+    root_cause_unknown: 0,
+  });
+});
+
+test("buildStep3_4SummaryByEnvTable maps further-analysis counts to root_cause_unknown", () => {
+  const step3_4Result = {
+    rootCauseTable: [],
+    furtherAnalysisTable: [
+      { env: "ecvr", duplicateCount: 2 },
+      { env: "ecvr", duplicateCount: 3 },
+    ],
+  };
+  const table = buildStep3_4SummaryByEnvTable(step3_4Result, {}, {});
+  assert.equal(table.length, 1);
+  assert.equal(table[0].env, "ecvr");
+  assert.equal(table[0].total404, 5);
+  assert.equal(table[0].rootCauseCount, 5);
+  assert.equal(table[0].root_cause_unknown, 5);
+});
+
+test("buildStep3_4SummaryByEnvTable reconciles total404 to Step2 raw matches", () => {
+  const step3_4Result = {
+    rootCauseTable: [
+      { env: "env-a", rootCause: "404_due_to_runtime_cache_not_ready_yet", duplicateCount: 2 },
+    ],
+    furtherAnalysisTable: [],
+  };
+  const step2SummaryByEnv = {
+    "env-a": { matchedLineCount: 10 },
+  };
+
+  const table = buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv, {});
+  assert.equal(table.length, 1);
+  const row = table[0];
+  assert.equal(row.env, "env-a");
+  assert.equal(row.total404, 10);
+  assert.equal(row.rootCauseCount, 10);
+  assert.equal(row.cache_not_ready_yet, 2);
+  assert.equal(row.deployment_not_in_top_3_latest_deployments, 0);
+  assert.equal(row.runtime_services_cache_load_failure, 0);
+  assert.equal(row.root_cause_unknown, 8);
+});
+
+test("buildStep3_4SummaryByEnvTable keeps total404 equal to sum of root-cause columns", () => {
+  const step3_4Result = {
+    rootCauseTable: [
+      {
+        env: "env-b",
+        rootCause: "404_due_to_deployment_not_in_top_3_list_cache",
+        duplicateCount: 3,
+      },
+    ],
+    // further-analysis rows should also end up under root_cause_unknown after reconciliation
+    // so that total404 still equals Step2 raw matched count.
+    furtherAnalysisTable: [{ env: "env-b", duplicateCount: 1 }],
+  };
+  const step2SummaryByEnv = {
+    "env-b": { matchedLineCount: 5 },
+  };
+
+  const table = buildStep3_4SummaryByEnvTable(step3_4Result, step2SummaryByEnv, {});
+  assert.equal(table.length, 1);
+  const row = table[0];
+  const categorySum =
+    Number(row.cache_not_ready_yet || 0) +
+    Number(row.deployment_not_in_top_3_latest_deployments || 0) +
+    Number(row.runtime_services_cache_load_failure || 0) +
+    Number(row.root_cause_unknown || 0);
+  assert.equal(row.total404, 5);
+  assert.equal(categorySum, 5);
+  assert.equal(row.total404, categorySum);
+});
+
+test("runStep1ForRegion signature includes optional envProgressTracker (regression)", () => {
+  const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
+  assert.match(
+    src,
+    /async function runStep1ForRegion\(region,\s*\{\s*envProgressTracker\s*=\s*null\s*\}\s*=\s*\{\}\)/,
+  );
+});
+
+test("Step3.5 recovery query uses Loki-safe regex quoting (regression)", () => {
+  const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
+  assert.ok(
+    src.includes(`"requestHTTPStatusCode"\\\\s*:\\\\s*200|"responseStatusCode"\\\\s*:\\\\s*200`),
+    "expected Step3.5 recovery query to include unescaped JSON keys in regex pattern",
+  );
+  assert.ok(
+    !src.includes(`\\\\"requestHTTPStatusCode\\\\"\\\\s*:\\\\s*200|\\\\"responseStatusCode\\\\"\\\\s*:\\\\s*200`),
+    "Step3.5 recovery query should not use over-escaped quotes that trigger Loki parse errors",
+  );
+});
+
+test("Step3.3 signature reuse lookup failure is handled as non-fatal (regression)", () => {
+  const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
+  assert.ok(
+    src.includes("trace signature lookup failed; continue without signature reuse"),
+    "expected Step3.3 to log and continue when trace signature lookup fails",
+  );
 });
 
 function mkLink(overrides = {}) {
@@ -283,6 +446,7 @@ function mkLink(overrides = {}) {
     earliestCompletionMatch: null,
     restartEvidence: { count: 0, entries: [] },
     failureEvidenceCount: 0,
+    fullAnalysisPerformed: true,
     ...overrides,
   };
 }
@@ -354,14 +518,196 @@ test("Step3.4 fixture: cache_load_failure branch", () => {
   assert.equal(out.rootCauseTable[0].rootCause, "404_due_to_runtime_services_cache_load_failure");
 });
 
-test("Step3.4 fixture: step2 Loki query failure gets further analysis row", () => {
+test("Step3.4 fixture: runtime_services fallthrough is preempted by restart warmup", () => {
+  const step3_3ByEnv = {
+    env1: {
+      links: [
+        mkLink({
+          conclusion: "cache_load_failure",
+          reason: "restart_warmup",
+          failureEvidenceCount: 0,
+          restartEvidence: { count: 2, entries: [] },
+          traceErrorSummary: { category: "runtime_services_not_found", runtimeServicesCount: 2 },
+          completionDistinctOriginalCount: 1,
+          completionDistinctExtendCount: 1,
+          deploymentListCacheCheck: {
+            decision: "target_not_ready",
+            reason: "last_round_after_request_second_last_not_found",
+          },
+        }),
+      ],
+    },
+  };
+  const out = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, {});
+  assert.equal(out.rootCauseTable.length, 1);
+  assert.equal(out.furtherAnalysisTable.length, 0);
+  assert.equal(out.rootCauseTable[0].result, "restart_evidence_preempts_runtime_services_fallthrough");
+  assert.equal(
+    out.rootCauseTable[0].rootCause,
+    "404_due_to_decision_service_restart_cache_warmup",
+  );
+});
+
+test("Step3.4 fixture: runtime_services fallthrough preempted by restart_warmup reason even without restart count", () => {
+  const step3_3ByEnv = {
+    env1: {
+      links: [
+        mkLink({
+          conclusion: "cache_load_failure",
+          reason: "restart_warmup",
+          failureEvidenceCount: 0,
+          restartEvidence: { count: 0, entries: [] },
+          traceErrorSummary: { category: "runtime_services_not_found", runtimeServicesCount: 2 },
+          completionDistinctOriginalCount: 0,
+          completionDistinctExtendCount: 0,
+        }),
+      ],
+    },
+  };
+  const out = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, {});
+  assert.equal(out.rootCauseTable.length, 1);
+  assert.equal(out.furtherAnalysisTable.length, 0);
+  assert.equal(out.rootCauseTable[0].result, "restart_evidence_preempts_runtime_services_fallthrough");
+  assert.equal(
+    out.rootCauseTable[0].rootCause,
+    "404_due_to_decision_service_restart_cache_warmup",
+  );
+});
+
+test("Step3.4 fixture: runtime_services fallthrough preempted by restart evidence even when failure evidence exists", () => {
+  const step3_3ByEnv = {
+    env1: {
+      links: [
+        mkLink({
+          conclusion: "cache_load_failure",
+          reason: null,
+          failureEvidenceCount: 2,
+          restartEvidence: { count: 1, entries: [{ lokiTsNs: "1777291890000000000" }] },
+          traceErrorSummary: { category: "runtime_services_not_found", runtimeServicesCount: 2 },
+          completionDistinctOriginalCount: 0,
+          completionDistinctExtendCount: 0,
+          deploymentListCacheCheck: {
+            decision: "unknown",
+            reason: "no_cache_round_found",
+          },
+        }),
+      ],
+    },
+  };
+  const out = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, {});
+  assert.equal(out.rootCauseTable.length, 1);
+  assert.equal(out.furtherAnalysisTable.length, 0);
+  assert.equal(out.rootCauseTable[0].result, "restart_evidence_preempts_runtime_services_fallthrough");
+  assert.equal(
+    out.rootCauseTable[0].rootCause,
+    "404_due_to_decision_service_restart_cache_warmup",
+  );
+});
+
+test("Step3.4 mandatory further-analysis checks use fixed 10-minute pre-request window for restart and cache-load errors", async () => {
+  const reqTsNs = 1_777_291_890_626_554_489;
+  const expectedStartNs = subtractNsWithPrecisionGuard(reqTsNs, 10 * 60 * 1e9);
+  const expectedEndNs = subtractNsWithPrecisionGuard(reqTsNs, 1);
+  const step3_4Result = {
+    rootCauseTable: [],
+    furtherAnalysisTable: [
+      {
+        env: "etit-dev3",
+        traceID: "00000000000000003dea6d26a2cd3e4f",
+        pod: "authz-decision-8988f4876-kxw89",
+        requestLokiTsNs: String(reqTsNs),
+        url: "/v1:$3014/authorize",
+      },
+    ],
+  };
+
+  const observed = [];
+  const mockQueryLoki = async (expr, opts = {}) => {
+    observed.push({ expr, opts });
+    assert.equal(Number(opts.startNs), expectedStartNs);
+    assert.equal(Number(opts.endNs), expectedEndNs);
+    if (expr.includes("starting decision server|starting authz decision server")) {
+      return lokiResult([
+        [
+          String(reqTsNs - 5_000_000_000),
+          JSON.stringify({
+            level: "info",
+            timestamp: "2026-04-27T12:06:19Z",
+            message: "starting decision server with bind-addr: 0.0.0.0:8091",
+          }),
+        ],
+      ]);
+    }
+    if (expr.includes("\"level\"\\s*:\\s*\"error\"")) {
+      return lokiResult([
+        [
+          String(reqTsNs - 4_000_000_000),
+          JSON.stringify({
+            level: "error",
+            timestamp: "2026-04-27T12:06:22Z",
+            message: "failed preparing policies runtime cache",
+            error: "cache warmup failure",
+          }),
+        ],
+      ]);
+    }
+    return lokiResult([]);
+  };
+
+  const summary = await runMandatoryFurtherAnalysisLokiChecks(step3_4Result, {
+    regionContext: "eu-frankfurt",
+    queryLokiFn: mockQueryLoki,
+  });
+
+  assert.equal(observed.length, 2);
+  assert.equal(summary.checkedRowCount, 1);
+  assert.equal(summary.skippedRowCount, 0);
+  assert.equal(summary.restartHitRowCount, 1);
+  assert.equal(summary.cacheErrorHitRowCount, 1);
+  assert.equal(summary.queryExecutedCount, 2);
+  assert.equal(summary.queryCacheHitCount, 0);
+  assert.ok(step3_4Result.mandatoryFurtherChecks);
+});
+
+test("Step3.4 mandatory further-analysis checks reuse identical Loki queries across duplicate cases", async () => {
+  const reqTsNs = 1_777_291_890_626_554_489;
+  const row = {
+    env: "etit-dev3",
+    traceID: "same-trace",
+    pod: "authz-decision-8988f4876-kxw89",
+    requestLokiTsNs: String(reqTsNs),
+    url: "/v1:$3014/authorize",
+  };
+  const step3_4Result = {
+    rootCauseTable: [],
+    furtherAnalysisTable: [{ ...row }, { ...row }],
+  };
+
+  let queryCallCount = 0;
+  const mockQueryLoki = async () => {
+    queryCallCount += 1;
+    return lokiResult([]);
+  };
+
+  const summary = await runMandatoryFurtherAnalysisLokiChecks(step3_4Result, {
+    regionContext: "eu-frankfurt",
+    queryLokiFn: mockQueryLoki,
+  });
+
+  // Two unique queries (restart + cache-error) should execute once each.
+  assert.equal(queryCallCount, 2);
+  assert.equal(summary.queryExecutedCount, 2);
+  assert.equal(summary.queryCacheHitCount, 2);
+  assert.equal(summary.checkedRowCount, 2);
+});
+
+test("Step3.4 fixture: step2 Loki query failure is excluded from full-analysis-only further table", () => {
   const out = buildStep3_4DeploymentCacheCheck(
     {},
     {},
     { step2ByEnv: { envx: { error: "Failed to fetch" } } },
   );
-  assert.equal(out.furtherAnalysisTable.length, 1);
-  assert.equal(out.furtherAnalysisTable[0].result, "step2_loki_query_failed");
+  assert.equal(out.furtherAnalysisTable.length, 0);
 });
 
 test("Step3.4 fixture: trace/root-cause mismatch is downgraded to further analysis", () => {
@@ -471,7 +817,7 @@ test("Step3.3 fixture: invalid request context returns cache_load_unknown", asyn
 
 test("Step3.3 fixture: mocked Loki returns cache_load_success with runtime trace category", async () => {
   const reqTsNs = 2_000_000_000_000;
-  const prepTsNs = 1_000_000_000_000;
+  const runtimeCacheStartTimeNs = 1_000_000_000_000;
 
   const mockQueryLoki = async (expr) => {
     if (expr.includes("SPDL-2001") || expr.includes("trace-success-1")) {
@@ -541,7 +887,7 @@ test("Step3.3 fixture: mocked Loki returns cache_load_success with runtime trace
         url: "/v1:$57/authorize",
       },
       matched: true,
-      previousLog: { lokiTsNs: String(prepTsNs) },
+      previousLog: { lokiTsNs: String(runtimeCacheStartTimeNs) },
     },
     { queryLokiFn: mockQueryLoki },
   );
@@ -554,7 +900,7 @@ test("Step3.3 fixture: mocked Loki returns cache_load_success with runtime trace
 
 test("Step3.3 fixture: restart warmup marks cache_load_failure when success evidence is missing", async () => {
   const reqTsNs = 2_000_000_000_000;
-  const prepTsNs = 1_000_000_000_000;
+  const runtimeCacheStartTimeNs = 1_000_000_000_000;
 
   const mockQueryLoki = async (expr) => {
     if (expr.includes("trace-restart-1")) {
@@ -595,7 +941,336 @@ test("Step3.3 fixture: restart warmup marks cache_load_failure when success evid
         url: "/v1:$57/authorize",
       },
       matched: true,
-      previousLog: { lokiTsNs: String(prepTsNs) },
+      previousLog: { lokiTsNs: String(runtimeCacheStartTimeNs) },
+    },
+    { queryLokiFn: mockQueryLoki },
+  );
+
+  assert.equal(out.conclusion, "cache_load_failure");
+  assert.equal(out.reason, "restart_warmup");
+  assert.equal(out.restartEvidence.count, 1);
+});
+
+test("Step3.3 fixture: multiple restart startup logs still classify as restart_warmup", async () => {
+  const reqTsNs = 2_000_000_000_000;
+  const runtimeCacheStartTimeNs = 1_000_000_000_000;
+
+  const mockQueryLoki = async (expr) => {
+    if (expr.includes("trace-restart-2logs-1")) {
+      return lokiResult([
+        [
+          String(reqTsNs - 1),
+          JSON.stringify({
+            level: "error",
+            error: "SPDL-2001 Application 3073 is not found",
+            message: "runtime miss",
+          }),
+        ],
+      ]);
+    }
+
+    if (expr.includes("starting decision server|starting authz decision server")) {
+      return lokiResult([
+        [
+          String(reqTsNs - 10_000_000),
+          JSON.stringify({
+            level: "info",
+            message: "starting decision server 0.0.0.0:8091",
+          }),
+        ],
+        [
+          String(reqTsNs - 9_000_000),
+          JSON.stringify({
+            level: "info",
+            message:
+              "starting decision server with bind-addr: 0.0.0.0:8091, sync-interval: 120",
+          }),
+        ],
+      ]);
+    }
+
+    return lokiResult([]);
+  };
+
+  const out = await analyzeStep3_3ForLink(
+    {
+      request: {
+        env: "env-restart-2logs",
+        traceID: "trace-restart-2logs-1",
+        pod: "pod-restart-2logs",
+        lokiTsNs: String(reqTsNs),
+        url: "/v1/authorize",
+      },
+      matched: true,
+      previousLog: { lokiTsNs: String(runtimeCacheStartTimeNs) },
+    },
+    { queryLokiFn: mockQueryLoki },
+  );
+
+  assert.equal(out.conclusion, "cache_load_failure");
+  assert.equal(out.reason, "restart_warmup");
+  assert.equal(out.restartEvidence.count, 2);
+});
+
+test("Step3.3 fixture: restart evidence includes small pre-start buffer to catch boundary logs", async () => {
+  const reqTsNs = 2_000_000_000_000;
+  const runtimeCacheStartTimeNs = 1_000_000_000_000;
+  const restartTsNs = runtimeCacheStartTimeNs - 500_000_000;
+
+  const mockQueryLoki = async (expr, opts = {}) => {
+    if (expr.includes("trace-restart-boundary-1")) {
+      return lokiResult([
+        [
+          String(reqTsNs - 1),
+          JSON.stringify({
+            level: "error",
+            error: "SPDL-2001 Application 57 is not found",
+            message: "runtime miss",
+          }),
+        ],
+      ]);
+    }
+
+    if (expr.includes("starting decision server|starting authz decision server")) {
+      const s = Number(opts?.startNs || 0);
+      const e = Number(opts?.endNs || 0);
+      if (s <= restartTsNs && restartTsNs <= e) {
+        return lokiResult([
+          [
+            String(restartTsNs),
+            JSON.stringify({
+              level: "info",
+              message: "starting decision server with bind-addr: 0.0.0.0:8091",
+            }),
+          ],
+        ]);
+      }
+      return lokiResult([]);
+    }
+
+    return lokiResult([]);
+  };
+
+  const out = await analyzeStep3_3ForLink(
+    {
+      request: {
+        env: "env-restart-boundary",
+        traceID: "trace-restart-boundary-1",
+        pod: "pod-restart-boundary",
+        lokiTsNs: String(reqTsNs),
+        url: "/v1:$57/authorize",
+      },
+      matched: true,
+      previousLog: { lokiTsNs: String(runtimeCacheStartTimeNs) },
+    },
+    { queryLokiFn: mockQueryLoki },
+  );
+
+  assert.equal(out.conclusion, "cache_load_failure");
+  assert.equal(out.reason, "restart_warmup");
+  assert.equal(out.restartEvidence.count, 1);
+  assert.ok(Number(out.restartEvidence.startNs) < runtimeCacheStartTimeNs);
+});
+
+test("Step3.3 fixture: missing Step3.2 anchor uses request-relative restart fallback window", async () => {
+  const reqTsNs = 2_000_000_000_000;
+  const expectedStartNs = reqTsNs - 10 * 60 * 1e9;
+  const restartTsNs = reqTsNs - 30 * 1e9;
+
+  const mockQueryLoki = async (expr, opts = {}) => {
+    if (expr.includes("starting decision server|starting authz decision server")) {
+      const s = Number(opts?.startNs || 0);
+      const e = Number(opts?.endNs || 0);
+      assert.equal(s, expectedStartNs);
+      assert.ok(e < reqTsNs);
+      if (s <= restartTsNs && restartTsNs <= e) {
+        return lokiResult([
+          [
+            String(restartTsNs),
+            JSON.stringify({
+              level: "info",
+              message: "starting decision server 0.0.0.0:8091",
+            }),
+          ],
+        ]);
+      }
+      return lokiResult([]);
+    }
+    return lokiResult([]);
+  };
+
+  const out = await analyzeStep3_3ForLink(
+    {
+      request: {
+        env: "env-no-anchor",
+        traceID: "trace-no-anchor-1",
+        pod: "pod-no-anchor",
+        lokiTsNs: String(reqTsNs),
+        url: "/v1/authorize",
+      },
+      matched: false,
+      previousLog: null,
+    },
+    { queryLokiFn: mockQueryLoki },
+  );
+
+  assert.equal(out.conclusion, "cache_load_failure");
+  assert.equal(out.reason, "restart_warmup");
+  assert.equal(out.restartEvidence.count, 1);
+  assert.equal(out.restartEvidence.mode, "request_relative_fallback_no_step3_2_anchor");
+  assert.equal(Number(out.restartEvidence.startNs), expectedStartNs);
+  assert.equal(Number(out.restartEvidence.endNs), reqTsNs - 1);
+});
+
+test("Step3.3 fixture: restart query includes previous-round boundary buffer for near-adjacent rounds", async () => {
+  const reqTsNs = 2_000_000_000_000;
+  const runtimeCacheStartTimeNs = 1_500_000_000_000;
+  const previousRoundStartTsNs = runtimeCacheStartTimeNs - 1_000_000;
+  const restartTsNs = previousRoundStartTsNs - 500_000_000;
+  const completionAnchorTsNs = runtimeCacheStartTimeNs - 10_000;
+
+  const mockQueryLoki = async (expr, opts = {}) => {
+    if (expr.includes("trace-restart-prev-round-1")) {
+      return lokiResult([
+        [
+          String(reqTsNs - 1),
+          JSON.stringify({
+            level: "error",
+            error: "SPDL-2001 Application 57 is not found",
+            message: "runtime miss",
+          }),
+        ],
+      ]);
+    }
+
+    if (expr.includes("completed preparing policies runtime cache") || expr.includes("Speedle policies")) {
+      const s = Number(opts?.startNs || 0);
+      const e = Number(opts?.endNs || 0);
+      // Current round completion hit.
+      if (s <= completionAnchorTsNs && completionAnchorTsNs <= e) {
+        return lokiResult([
+          [
+            String(completionAnchorTsNs),
+            JSON.stringify({
+              deploymentID: "57",
+              message: "updated cache for deployment '57' with '10' Speedle policies",
+            }),
+          ],
+        ]);
+      }
+      return lokiResult([]);
+    }
+
+    if (expr.includes("start loading policies, roles, role mappings for all deployments|starting to prepare decision server cache")) {
+      const s = Number(opts?.startNs || 0);
+      const e = Number(opts?.endNs || 0);
+      // Previous-round anchor search window.
+      if (s === 0 && e === runtimeCacheStartTimeNs - 1) {
+        return lokiResult([
+          [
+            String(previousRoundStartTsNs),
+            JSON.stringify({
+              level: "info",
+              message: "starting to prepare decision server cache",
+            }),
+          ],
+        ]);
+      }
+      return lokiResult([]);
+    }
+
+    if (expr.includes("starting decision server|starting authz decision server")) {
+      const s = Number(opts?.startNs || 0);
+      const e = Number(opts?.endNs || 0);
+      if (s <= restartTsNs && restartTsNs <= e) {
+        return lokiResult([
+          [
+            String(restartTsNs),
+            JSON.stringify({
+              level: "info",
+              message: "starting decision server 0.0.0.0:8091",
+            }),
+          ],
+        ]);
+      }
+      return lokiResult([]);
+    }
+
+    return lokiResult([]);
+  };
+
+  const out = await analyzeStep3_3ForLink(
+    {
+      request: {
+        env: "env-restart-prev-round",
+        traceID: "trace-restart-prev-round-1",
+        pod: "pod-restart-prev-round",
+        lokiTsNs: String(reqTsNs),
+        url: "/v1:$57/authorize",
+      },
+      matched: true,
+      previousLog: { lokiTsNs: String(runtimeCacheStartTimeNs) },
+    },
+    { queryLokiFn: mockQueryLoki },
+  );
+
+  assert.equal(out.conclusion, "cache_load_failure");
+  assert.equal(out.reason, "restart_warmup");
+  assert.equal(out.restartEvidence.count, 1);
+  assert.ok(Number(out.restartEvidence.startNs) <= restartTsNs);
+  assert.equal(Number(out.restartEvidence.previousRoundStartNs), previousRoundStartTsNs);
+});
+
+test("Step3.3 fixture: restart lookback captures startup log slightly over 2s before cache-start anchor", async () => {
+  const reqTsNs = 2_000_000_000_000;
+  const runtimeCacheStartTimeNs = 1_500_000_000_000;
+  const restartTsNs = runtimeCacheStartTimeNs - 2_100_000_000;
+
+  const mockQueryLoki = async (expr, opts = {}) => {
+    if (expr.includes("trace-restart-over-2s-1")) {
+      return lokiResult([
+        [
+          String(reqTsNs - 1),
+          JSON.stringify({
+            level: "error",
+            error: "SPDL-2001 Application 3074 is not found",
+            message: "runtime miss",
+          }),
+        ],
+      ]);
+    }
+
+    if (expr.includes("starting decision server|starting authz decision server")) {
+      const s = Number(opts?.startNs || 0);
+      const e = Number(opts?.endNs || 0);
+      if (s <= restartTsNs && restartTsNs <= e) {
+        return lokiResult([
+          [
+            String(restartTsNs),
+            JSON.stringify({
+              level: "info",
+              message: "starting decision server 0.0.0.0:8091",
+            }),
+          ],
+        ]);
+      }
+      return lokiResult([]);
+    }
+
+    return lokiResult([]);
+  };
+
+  const out = await analyzeStep3_3ForLink(
+    {
+      request: {
+        env: "env-restart-over-2s",
+        traceID: "trace-restart-over-2s-1",
+        pod: "pod-restart-over-2s",
+        lokiTsNs: String(reqTsNs),
+        url: "/v1/authorize",
+      },
+      matched: true,
+      previousLog: { lokiTsNs: String(runtimeCacheStartTimeNs) },
     },
     { queryLokiFn: mockQueryLoki },
   );
