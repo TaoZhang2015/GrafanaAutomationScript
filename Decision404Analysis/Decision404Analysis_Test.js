@@ -369,7 +369,7 @@ test("runStep1ForRegion signature includes optional envProgressTracker (regressi
   const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
   assert.match(
     src,
-    /async function runStep1ForRegion\(region,\s*\{\s*envProgressTracker\s*=\s*null\s*\}\s*=\s*\{\}\)/,
+    /async function runStep1ForRegion\(region,\s*\{\s*envProgressTracker\s*=\s*null,\s*step1Window\s*=\s*null\s*\}\s*=\s*\{\}\)/,
   );
 });
 
@@ -385,11 +385,54 @@ test("Step3.5 recovery query uses Loki-safe regex quoting (regression)", () => {
   );
 });
 
-test("Step3.3 signature reuse lookup failure is handled as non-fatal (regression)", () => {
+test("Step3.3 reuse guard remains strict same-trace short-window mode (regression)", () => {
   const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
   assert.ok(
-    src.includes("trace signature lookup failed; continue without signature reuse"),
-    "expected Step3.3 to log and continue when trace signature lookup fails",
+    src.includes("reuse logic enabled with strict same-traceID guard"),
+    "expected Step3.3 to keep strict same-traceID-only reuse guard",
+  );
+});
+
+test("Step3.3 moving-window cache cleanup is present (regression)", () => {
+  const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
+  assert.ok(
+    src.includes("moving-window cache cleaned for env"),
+    "expected Step3.3 to log env-level moving-window cache cleanup",
+  );
+  assert.ok(
+    src.includes("envTimeline.podTimelines.clear()"),
+    "expected Step3.3 to clear pod timelines after env processing",
+  );
+  assert.ok(
+    src.includes("fastTimelineByEnv.delete(env)"),
+    "expected Step3.3 to delete env timeline cache entry after env processing",
+  );
+});
+
+test("Step3.3 moving-window efficiency telemetry fields are emitted (regression)", () => {
+  const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
+  for (const field of [
+    "movingWindowHitPct",
+    "movingWindowFastPathHitPct",
+    "movingWindowReuseHitPct",
+    "timelineLookupAttemptCount",
+    "fastPathFallbackCount",
+    "cacheOnlyNoTimelineMatchCount",
+    "requestTsDirectionSwitchCount",
+  ]) {
+    assert.ok(src.includes(field), `expected Step3.3 summary to include telemetry field ${field}`);
+  }
+});
+
+test("Step3.4 backfill safety for unclassified links is present (regression)", () => {
+  const src = fs.readFileSync(path.join(__dirname, "Decision404Analysis.js"), "utf8");
+  assert.ok(
+    src.includes("missing_step3_4_classification_backfilled_for_mandatory_checks"),
+    "expected Step3.4 to backfill unclassified links into further-analysis table",
+  );
+  assert.ok(
+    src.includes("backfilled unclassified case into further analysis table"),
+    "expected Step3.4 to log each backfilled unclassified case",
   );
 });
 
@@ -541,7 +584,7 @@ test("Step3.4 fixture: runtime_services fallthrough is preempted by restart warm
   const out = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, {});
   assert.equal(out.rootCauseTable.length, 1);
   assert.equal(out.furtherAnalysisTable.length, 0);
-  assert.equal(out.rootCauseTable[0].result, "restart_evidence_preempts_runtime_services_fallthrough");
+  assert.equal(out.rootCauseTable[0].result, "single_restart_log_in_step3_3_window");
   assert.equal(
     out.rootCauseTable[0].rootCause,
     "404_due_to_decision_service_restart_cache_warmup",
@@ -567,7 +610,7 @@ test("Step3.4 fixture: runtime_services fallthrough preempted by restart_warmup 
   const out = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, {});
   assert.equal(out.rootCauseTable.length, 1);
   assert.equal(out.furtherAnalysisTable.length, 0);
-  assert.equal(out.rootCauseTable[0].result, "restart_evidence_preempts_runtime_services_fallthrough");
+  assert.equal(out.rootCauseTable[0].result, "single_restart_log_in_step3_3_window");
   assert.equal(
     out.rootCauseTable[0].rootCause,
     "404_due_to_decision_service_restart_cache_warmup",
@@ -701,13 +744,15 @@ test("Step3.4 mandatory further-analysis checks reuse identical Loki queries acr
   assert.equal(summary.checkedRowCount, 2);
 });
 
-test("Step3.4 fixture: step2 Loki query failure is excluded from full-analysis-only further table", () => {
+test("Step3.4 fixture: step2 Loki query failure is retained in further table for mandatory checks", () => {
   const out = buildStep3_4DeploymentCacheCheck(
     {},
     {},
     { step2ByEnv: { envx: { error: "Failed to fetch" } } },
   );
-  assert.equal(out.furtherAnalysisTable.length, 0);
+  assert.equal(out.furtherAnalysisTable.length, 1);
+  assert.equal(out.furtherAnalysisTable[0].result, "step2_loki_query_failed");
+  assert.equal(out.furtherAnalysisTable[0].action, "further_analysis_required");
 });
 
 test("Step3.4 fixture: trace/root-cause mismatch is downgraded to further analysis", () => {
