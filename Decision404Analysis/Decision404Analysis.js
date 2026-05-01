@@ -24,7 +24,7 @@ const ANALYSIS_CONFIG = {
   maxParallelEnvs: 4,
   throttleBetweenRegionsMs: 400,
   grafanaApiMinIntervalMs: 120,
-  grafanaRetryMaxAttempts: 1,
+  grafanaRetryMaxAttempts: 3,
   grafanaRetryBaseDelayMs: 300,
   step1RangeStartPst: "2026-04-27T00:00:00-00:00",
   step1RangeEndPst: "2026-04-27T23:59:59-00:00",
@@ -35,6 +35,8 @@ const ANALYSIS_CONFIG = {
   step2AutoSplitOnLimit: true,
   step2SplitMaxDepth: 8,
   step2SplitMinWindowMinutes: 60,
+  step2ParallelRecoveryStableBatches: 2,
+  step2ParallelRecoveryStep: 1,
   step2RunMetricCountOnUnsplittableLimitHit: true,
   step3_3SkipTraceLookupWhenStep2UnsplittableLimitHit: true,
   step3_3RepeatedTraceWarnThreshold: 2,
@@ -1594,6 +1596,9 @@ async function collectDecision404LogsByEnv(
   const byEnv = {};
   const maxParallelEnvs = getMaxParallelEnvs();
   let currentParallelEnvs = maxParallelEnvs;
+  const recoveryStableBatches = Math.max(1, Math.floor(Number(ANALYSIS_CONFIG.step2ParallelRecoveryStableBatches || 2)));
+  const recoveryStep = Math.max(1, Math.floor(Number(ANALYSIS_CONFIG.step2ParallelRecoveryStep || 1)));
+  let stableBatchStreak = 0;
   let cursor = 0;
 
   while (cursor < envList.length) {
@@ -1693,12 +1698,29 @@ async function collectDecision404LogsByEnv(
     if (throttleHitCount > 0 && currentParallelEnvs > 1) {
       const prev = currentParallelEnvs;
       currentParallelEnvs = Math.max(1, Math.floor(currentParallelEnvs / 2));
+      stableBatchStreak = 0;
       appendRunLog("STEP2", "detected HTTP 429; reducing env parallelism", {
         throttleHitCount,
         batchSize: batch.length,
         previousParallelEnvs: prev,
         nextParallelEnvs: currentParallelEnvs,
       });
+    } else if (throttleHitCount === 0 && currentParallelEnvs < maxParallelEnvs) {
+      stableBatchStreak += 1;
+      if (stableBatchStreak >= recoveryStableBatches) {
+        const prev = currentParallelEnvs;
+        currentParallelEnvs = Math.min(maxParallelEnvs, currentParallelEnvs + recoveryStep);
+        stableBatchStreak = 0;
+        appendRunLog("STEP2", "stable batches observed; increasing env parallelism", {
+          batchSize: batch.length,
+          previousParallelEnvs: prev,
+          nextParallelEnvs: currentParallelEnvs,
+          recoveryStableBatches,
+          recoveryStep,
+        });
+      }
+    } else if (throttleHitCount === 0) {
+      stableBatchStreak = 0;
     }
 
     cursor += batch.length;
