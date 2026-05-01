@@ -27,8 +27,8 @@ const ANALYSIS_CONFIG = {
   grafanaApiMinIntervalMs: 120,
   grafanaRetryMaxAttempts: 3,
   grafanaRetryBaseDelayMs: 300,
-  step1RangeStartPst: "2026-04-26T00:00:00-00:00",
-  step1RangeEndPst: "2026-04-26T01:59:59-00:00",
+  step1RangeStartPst: "2026-04-27T00:00:00-00:00",
+  step1RangeEndPst: "2026-04-27T01:59:59-00:00",
   step1MaxIntervalHours: 6,
   step3_3ReuseWindowMinutes: 10,
   step3_3ReuseWindowSeconds: 10,
@@ -1492,6 +1492,84 @@ function mapToRows(mapObj, keyName = "key") {
     }
   }
   return rows;
+}
+
+function toFiniteNumberOrZero(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function buildMergedExportRowsByEnv(summaryRows = [], furtherRows = []) {
+  const byKey = new Map();
+
+  function makeKey(region, env) {
+    return `${String(region || "")}|${String(env || "")}`;
+  }
+
+  function ensureRow(region, env) {
+    const key = makeKey(region, env);
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        region: String(region || ""),
+        env: String(env || ""),
+        total404: 0,
+        rootCauseCount: 0,
+        cache_not_ready_yet: 0,
+        deployment_not_in_top_3_latest_deployments: 0,
+        runtime_services_cache_load_failure: 0,
+        root_cause_unknown: 0,
+        recoveryStatus: "not_sure",
+        furtherAnalysisCaseCount: 0,
+        furtherAnalysis404Count: 0,
+        furtherAnalysisResultCounts: {},
+      });
+    }
+    return byKey.get(key);
+  }
+
+  for (const row of summaryRows || []) {
+    const x = ensureRow(row?.region, row?.env);
+    x.total404 += toFiniteNumberOrZero(row?.total404);
+    x.rootCauseCount += toFiniteNumberOrZero(row?.rootCauseCount);
+    x.cache_not_ready_yet += toFiniteNumberOrZero(row?.cache_not_ready_yet);
+    x.deployment_not_in_top_3_latest_deployments += toFiniteNumberOrZero(
+      row?.deployment_not_in_top_3_latest_deployments,
+    );
+    x.runtime_services_cache_load_failure += toFiniteNumberOrZero(
+      row?.runtime_services_cache_load_failure,
+    );
+    x.root_cause_unknown += toFiniteNumberOrZero(row?.root_cause_unknown);
+    const status = String(row?.recoveryStatus || "").trim() || "not_sure";
+    if (x.recoveryStatus === "not_sure") {
+      x.recoveryStatus = status;
+    } else if (status !== "not_sure" && status !== x.recoveryStatus) {
+      x.recoveryStatus = "mixed";
+    }
+  }
+
+  for (const row of furtherRows || []) {
+    const x = ensureRow(row?.region, row?.env);
+    const dup = Math.max(1, toFiniteNumberOrZero(row?.duplicateCount || 1));
+    const result = String(row?.result || "unknown");
+    x.furtherAnalysisCaseCount += 1;
+    x.furtherAnalysis404Count += dup;
+    x.furtherAnalysisResultCounts[result] =
+      toFiniteNumberOrZero(x.furtherAnalysisResultCounts[result]) + dup;
+  }
+
+  const out = [...byKey.values()];
+  for (const row of out) {
+    const sortedResultCounts = Object.entries(row.furtherAnalysisResultCounts || {}).sort((a, b) =>
+      String(a[0]).localeCompare(String(b[0])),
+    );
+    row.furtherAnalysisResultCounts = Object.fromEntries(sortedResultCounts);
+  }
+  out.sort((a, b) => {
+    const regionCmp = String(a?.region || "").localeCompare(String(b?.region || ""));
+    if (regionCmp !== 0) return regionCmp;
+    return String(a?.env || "").localeCompare(String(b?.env || ""));
+  });
+  return out;
 }
 
 function detectFileMetaByName(name) {
@@ -6687,6 +6765,22 @@ async function runDecision404AnalysisForRegion(
       envCount: Object.keys(step2Summary || {}).length,
     });
     console.log("Step 2 summary:", step2Summary);
+    const step2ErrorEnvs = Object.entries(lokiByEnv || {})
+      .filter(([, item]) => String(item?.error || "").trim().length > 0)
+      .map(([env, item]) => ({
+        env,
+        error: String(item?.error || ""),
+      }));
+    if (step2ErrorEnvs.length > 0) {
+      appendRunLog("RUN", "Region marked failed due to env-level Step2 data failures", {
+        region: activeRegion,
+        step2ErrorEnvCount: step2ErrorEnvs.length,
+        step2ErrorEnvSample: step2ErrorEnvs.slice(0, 20),
+      });
+      throw new Error(
+        `Step2 env data failures detected (region=${activeRegion}, count=${step2ErrorEnvs.length})`,
+      );
+    }
 
     const step3ParsedByEnv = buildStep3ParsedByEnv(lokiByEnv);
     const step3_1ValidationByEnv = buildStep3_1Validation(step3ParsedByEnv);
@@ -6968,8 +7062,18 @@ if (typeof window !== "undefined") {
         }
 
         const csvFiles = [];
+        const includedSummaryRows = [];
+        const includedFurtherRows = [];
+        const skippedIntervalDetails = [];
         for (const bucket of intervalBuckets) {
           if (!bucket.isCompleteForExport) {
+            skippedIntervalDetails.push({
+              intervalLabel: bucket.label,
+              intervalStartUtc: new Date(Number(bucket?.startMs || 0)).toISOString(),
+              intervalEndUtc: new Date(Number(bucket?.endMs || 0)).toISOString(),
+              step1FailedRegionCount: Number(bucket?.step1FailedRegions?.length || 0),
+              analysisFailedRegionCount: Number(bucket?.analysisFailedRegions?.length || 0),
+            });
             appendRunLog("RUN", "Interval CSV export skipped", {
               intervalLabel: bucket.label,
               reason: "interval_not_fully_completed",
@@ -6978,15 +7082,74 @@ if (typeof window !== "undefined") {
             });
             continue;
           }
-          csvFiles.push({
-            suggestedName: `decision404_summary_by_env_${bucket.label}.csv`,
-            content: rowsToCsv(bucket.summaryRows),
-          });
-          csvFiles.push({
-            suggestedName: `decision404_further_analysis_table_${bucket.label}.csv`,
-            content: rowsToCsv(bucket.furtherRows),
-          });
+          includedSummaryRows.push(...(bucket.summaryRows || []));
+          includedFurtherRows.push(...(bucket.furtherRows || []));
         }
+
+        const summaryByEnvMap = new Map();
+        for (const row of includedSummaryRows) {
+          const region = String(row?.region || "");
+          const env = String(row?.env || "");
+          const key = `${region}|${env}`;
+          if (!summaryByEnvMap.has(key)) {
+            summaryByEnvMap.set(key, {
+              region,
+              env,
+              total404: 0,
+              rootCauseCount: 0,
+              cache_not_ready_yet: 0,
+              deployment_not_in_top_3_latest_deployments: 0,
+              runtime_services_cache_load_failure: 0,
+              root_cause_unknown: 0,
+              recoveryStatus: "not_sure",
+            });
+          }
+          const acc = summaryByEnvMap.get(key);
+          acc.total404 += Number(row?.total404 || 0);
+          acc.rootCauseCount += Number(row?.rootCauseCount || 0);
+          acc.cache_not_ready_yet += Number(row?.cache_not_ready_yet || 0);
+          acc.deployment_not_in_top_3_latest_deployments += Number(
+            row?.deployment_not_in_top_3_latest_deployments || 0,
+          );
+          acc.runtime_services_cache_load_failure += Number(
+            row?.runtime_services_cache_load_failure || 0,
+          );
+          acc.root_cause_unknown += Number(row?.root_cause_unknown || 0);
+          const status = String(row?.recoveryStatus || "not_sure");
+          if (acc.recoveryStatus === "not_sure") {
+            acc.recoveryStatus = status;
+          } else if (status !== "not_sure" && status !== acc.recoveryStatus) {
+            acc.recoveryStatus = "mixed";
+          }
+        }
+        const aggregatedSummaryRows = [...summaryByEnvMap.values()].sort((a, b) => {
+          const regionCmp = String(a?.region || "").localeCompare(String(b?.region || ""));
+          if (regionCmp !== 0) return regionCmp;
+          return String(a?.env || "").localeCompare(String(b?.env || ""));
+        });
+        const aggregatedFurtherRows = [...includedFurtherRows];
+
+        appendRunLog("RUN", "CSV export prepared as two aggregated files", {
+          includedIntervalCount: intervalBuckets.length - skippedIntervalDetails.length,
+          skippedIntervalCount: skippedIntervalDetails.length,
+          skippedIntervals: skippedIntervalDetails.map(x => x.intervalLabel),
+          summaryRowsBeforeAggregate: includedSummaryRows.length,
+          summaryRowsAfterAggregate: aggregatedSummaryRows.length,
+          furtherRowsCombined: aggregatedFurtherRows.length,
+        });
+        appendRunLog("RUN", "Final CSV excluded interval summary", {
+          skippedIntervalCount: skippedIntervalDetails.length,
+          skippedIntervals: skippedIntervalDetails,
+        });
+
+        csvFiles.push({
+          suggestedName: "decision404_summary_by_env.csv",
+          content: rowsToCsv(aggregatedSummaryRows),
+        });
+        csvFiles.push({
+          suggestedName: "decision404_further_analysis_table.csv",
+          content: rowsToCsv(aggregatedFurtherRows),
+        });
 
         const runLogContent =
           [
