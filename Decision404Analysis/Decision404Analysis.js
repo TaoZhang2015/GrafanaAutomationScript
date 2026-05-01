@@ -13,6 +13,7 @@
 const RUN_LOG_LINES = [];
 let LOKI_QUERY_SEQ = 0;
 let LAST_API_CALL_AT_MS = 0;
+let ACTIVE_STEP_WINDOW_OVERRIDE_HOURS = null;
 
 // Frequently changed runtime settings
 const ANALYSIS_CONFIG = {
@@ -27,6 +28,7 @@ const ANALYSIS_CONFIG = {
   grafanaRetryBaseDelayMs: 300,
   step1RangeStartPst: "2026-04-27T00:00:00-00:00",
   step1RangeEndPst: "2026-04-27T23:59:59-00:00",
+  step1MaxIntervalHours: 6,
   step3_3ReuseWindowMinutes: 10,
   step3_3CompletionExtend1Minutes: 15,
   step3_3CompletionExtend2Minutes: 30,
@@ -157,12 +159,46 @@ function formatNsToPst(ns) {
 }
 
 function getConfiguredStepWindowHours() {
+  if (Number.isFinite(Number(ACTIVE_STEP_WINDOW_OVERRIDE_HOURS))) {
+    return Math.max(1, Number(ACTIVE_STEP_WINDOW_OVERRIDE_HOURS));
+  }
   const startMs = new Date(ANALYSIS_CONFIG.step1RangeStartPst).getTime();
   const endMs = new Date(ANALYSIS_CONFIG.step1RangeEndPst).getTime();
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 1;
   const hours = (endMs - startMs) / (60 * 60 * 1000);
   if (!Number.isFinite(hours) || hours <= 0) return 1;
   return hours;
+}
+
+function formatUtcCompactForFilename(ms) {
+  const iso = new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  return iso.replace(/[-:]/g, "");
+}
+
+function buildIntervalLabel(startMs, endMs) {
+  return `${formatUtcCompactForFilename(startMs)}_to_${formatUtcCompactForFilename(endMs)}`;
+}
+
+function splitStep1Windows(maxHours = 6) {
+  const base = getStep1WindowConfig();
+  const maxHoursNum = Number(maxHours);
+  const safeMaxHours = Number.isFinite(maxHoursNum) && maxHoursNum > 0 ? maxHoursNum : 6;
+  const chunkMs = Math.max(60 * 60 * 1000, Math.floor(safeMaxHours * 60 * 60 * 1000));
+  const windows = [];
+  let cursorStartMs = base.step1RangeStartMs;
+  let idx = 1;
+  while (cursorStartMs <= base.step1RangeEndMs) {
+    const cursorEndMs = Math.min(base.step1RangeEndMs, cursorStartMs + chunkMs - 1000);
+    windows.push({
+      index: idx,
+      startMs: cursorStartMs,
+      endMs: cursorEndMs,
+      label: buildIntervalLabel(cursorStartMs, cursorEndMs),
+    });
+    cursorStartMs = cursorEndMs + 1000;
+    idx += 1;
+  }
+  return windows;
 }
 
 function sleepMs(ms) {
@@ -265,6 +301,11 @@ function shouldRetryGrafanaStatus(statusCode) {
 function isFailedToFetchError(err) {
   const msg = String(err?.message || err || "").toLowerCase();
   return msg.includes("failed to fetch");
+}
+
+function isHttp429Error(err) {
+  const msg = String(err?.message || err || "");
+  return /\bHTTP\s+429\b/i.test(msg);
 }
 
 function shouldSplitOnGatewayStatus(statusCode) {
@@ -1552,12 +1593,18 @@ async function collectDecision404LogsByEnv(
 ) {
   const byEnv = {};
   const maxParallelEnvs = getMaxParallelEnvs();
+  let currentParallelEnvs = maxParallelEnvs;
+  let cursor = 0;
 
-  await mapWithConcurrency(envList, maxParallelEnvs, async env => {
+  while (cursor < envList.length) {
+    const batch = envList.slice(cursor, cursor + currentParallelEnvs);
+    const batchResults = await Promise.all(
+      batch.map(async env => {
     const expr =
       `${buildDecisionSelector(env, null)}` +
       ` != "/live" != "/ready"` +
       ` |~ \`"requestHTTPStatusCode"\\s*:\\s*404|"responseStatusCode"\\s*:\\s*404\``;
+        let throttle429 = false;
 
     try {
       const splitResult = await collectDecision404LogsForEnvWithAutoSplit(env, expr, {
@@ -1613,6 +1660,7 @@ async function collectDecision404LogsByEnv(
         isLimitLikelyHit,
       });
     } catch (e) {
+      throttle429 = isHttp429Error(e);
       byEnv[env] = {
         lokiQuery: expr,
         matchedLineCount: 0,
@@ -1634,7 +1682,27 @@ async function collectDecision404LogsByEnv(
       };
       console.error(`Step 2 env=${env} failed:`, e);
     }
-  });
+        return { env, throttle429 };
+      }),
+    );
+
+    const throttleHitCount = batchResults.reduce(
+      (sum, r) => sum + (r?.throttle429 ? 1 : 0),
+      0,
+    );
+    if (throttleHitCount > 0 && currentParallelEnvs > 1) {
+      const prev = currentParallelEnvs;
+      currentParallelEnvs = Math.max(1, Math.floor(currentParallelEnvs / 2));
+      appendRunLog("STEP2", "detected HTTP 429; reducing env parallelism", {
+        throttleHitCount,
+        batchSize: batch.length,
+        previousParallelEnvs: prev,
+        nextParallelEnvs: currentParallelEnvs,
+      });
+    }
+
+    cursor += batch.length;
+  }
 
   return byEnv;
 }
@@ -6070,12 +6138,18 @@ function buildStep2CompactSummary(step2ByEnv) {
   return out;
 }
 
-function getStep1WindowConfig() {
-  const step1RangeStartMs = new Date(ANALYSIS_CONFIG.step1RangeStartPst).getTime();
-  const step1RangeEndMs = new Date(ANALYSIS_CONFIG.step1RangeEndPst).getTime();
+function getStep1WindowConfig(windowOverride = null) {
+  const step1RangeStartMs =
+    windowOverride && Number.isFinite(Number(windowOverride.startMs))
+      ? Number(windowOverride.startMs)
+      : new Date(ANALYSIS_CONFIG.step1RangeStartPst).getTime();
+  const step1RangeEndMs =
+    windowOverride && Number.isFinite(Number(windowOverride.endMs))
+      ? Number(windowOverride.endMs)
+      : new Date(ANALYSIS_CONFIG.step1RangeEndPst).getTime();
   const step1RangeStartSec = Math.floor(step1RangeStartMs / 1000);
   const step1RangeEndSec = Math.floor(step1RangeEndMs / 1000);
-  const step1MimirHours = Math.round((step1RangeEndMs - step1RangeStartMs) / (60 * 60 * 1000));
+  const step1MimirHours = Math.max(1, Math.ceil((step1RangeEndMs - step1RangeStartMs) / (60 * 60 * 1000)));
   return {
     step1RangeStartMs,
     step1RangeEndMs,
@@ -6085,7 +6159,7 @@ function getStep1WindowConfig() {
   };
 }
 
-async function runStep1ForRegion(region, { envProgressTracker = null } = {}) {
+async function runStep1ForRegion(region, { envProgressTracker = null, step1Window = null } = {}) {
   const activeRegion = String(region || "").trim();
   const activeRegionConfig = buildRegionConfig(activeRegion);
   appendRunLog("RUN", "Region analysis started", {
@@ -6096,7 +6170,7 @@ async function runStep1ForRegion(region, { envProgressTracker = null } = {}) {
   });
 
   const { step1RangeStartMs, step1RangeEndMs, step1RangeStartSec, step1RangeEndSec, step1MimirHours } =
-    getStep1WindowConfig();
+    getStep1WindowConfig(step1Window);
 
   const expr =
     'sum by (prd_env) (rate(application_processed_requests_total{prd_fleet="faaas-prod", job="authz-decision", statuscode=~"404"}[5m])) > 0';
@@ -6129,9 +6203,7 @@ async function runStep1ForRegion(region, { envProgressTracker = null } = {}) {
     `Step 1 complete: decision service 404s in ${activeRegionConfig.displayName} (${activeRegion}) (fixed range)`,
   );
   console.log(
-    `Step 1 range (PST): ${ANALYSIS_CONFIG.step1RangeStartPst} to ${ANALYSIS_CONFIG.step1RangeEndPst} | UTC: ${new Date(
-      step1RangeStartMs,
-    ).toISOString()} to ${new Date(step1RangeEndMs).toISOString()}`,
+    `Step 1 range (UTC): ${new Date(step1RangeStartMs).toISOString()} to ${new Date(step1RangeEndMs).toISOString()}`,
   );
   console.log("Impacted env count:", summary.impactedEnvs.length);
   console.log("Impacted env list:", summary.impactedEnvs);
@@ -6149,13 +6221,16 @@ async function runStep1ForRegion(region, { envProgressTracker = null } = {}) {
   };
 }
 
-async function runDecision404AnalysisForRegion(region, { envProgressTracker = null, step1Result = null } = {}) {
+async function runDecision404AnalysisForRegion(
+  region,
+  { envProgressTracker = null, step1Result = null, step1Window = null } = {},
+) {
   const activeRegion = String(region || "").trim();
   const activeRegionConfig = buildRegionConfig(activeRegion);
   const resolvedStep1 =
     step1Result && step1Result.summary
       ? step1Result
-      : await runStep1ForRegion(region);
+      : await runStep1ForRegion(region, { step1Window });
 
   const {
     summary,
@@ -6173,250 +6248,306 @@ async function runDecision404AnalysisForRegion(region, { envProgressTracker = nu
   const step2RangeStartNs = step1RangeStartSec * 1e9;
   const step2RangeEndNs = step1RangeEndSec * 1e9;
   const STEP2_LOKI_HOURS = step1MimirHours;
-  const lokiByEnv = await collectDecision404LogsByEnv(summary.impactedEnvs, {
-    hours: STEP2_LOKI_HOURS,
-    limit: 3000,
-    startNs: step2RangeStartNs,
-    endNs: step2RangeEndNs,
-    regionContext: activeRegion,
-  });
+  const prevStepWindowOverride = ACTIVE_STEP_WINDOW_OVERRIDE_HOURS;
+  ACTIVE_STEP_WINDOW_OVERRIDE_HOURS = step1MimirHours;
+  try {
+    const lokiByEnv = await collectDecision404LogsByEnv(summary.impactedEnvs, {
+      hours: STEP2_LOKI_HOURS,
+      limit: 3000,
+      startNs: step2RangeStartNs,
+      endNs: step2RangeEndNs,
+      regionContext: activeRegion,
+    });
 
-  console.log("Step 2 complete.");
-  console.log(`Step 2 time window hours: ${STEP2_LOKI_HOURS}`);
-  console.log(
-    `Step 2 range (PST): ${ANALYSIS_CONFIG.step1RangeStartPst} to ${ANALYSIS_CONFIG.step1RangeEndPst} | UTC: ${new Date(
-      step1RangeStartMs,
-    ).toISOString()} to ${new Date(step1RangeEndMs).toISOString()}`,
-  );
-  const step2Summary = buildStep2CompactSummary(lokiByEnv);
-  appendRunLog("STEP2", "Loki 404 request collection completed", {
-    region: activeRegion,
-    envCount: Object.keys(step2Summary || {}).length,
-  });
-  console.log("Step 2 summary:", step2Summary);
+    console.log("Step 2 complete.");
+    console.log(`Step 2 time window hours: ${STEP2_LOKI_HOURS}`);
+    console.log(
+      `Step 2 range (UTC): ${new Date(step1RangeStartMs).toISOString()} to ${new Date(step1RangeEndMs).toISOString()}`,
+    );
+    const step2Summary = buildStep2CompactSummary(lokiByEnv);
+    appendRunLog("STEP2", "Loki 404 request collection completed", {
+      region: activeRegion,
+      envCount: Object.keys(step2Summary || {}).length,
+    });
+    console.log("Step 2 summary:", step2Summary);
 
-  const step3ParsedByEnv = buildStep3ParsedByEnv(lokiByEnv);
-  const step3_1ValidationByEnv = buildStep3_1Validation(step3ParsedByEnv);
-  const step3_1SummaryByEnv = summarizeStep3_1Validation(step3_1ValidationByEnv);
-  const step3_2ByEnv = await buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, {
-    lookbackHours: 1,
-    regionContext: activeRegion,
-  });
-  const step3_2SummaryByEnv = summarizeStep3_2PreviousLog(step3_2ByEnv);
-  const step3_3ByEnv = await buildStep3_3CacheLoadingByEnv(step3_2ByEnv, {
-    regionContext: activeRegion,
-    envProgressTracker,
-  });
-  const step3_3SummaryByEnv = summarizeStep3_3CacheLoading(step3_3ByEnv);
-  const step3_3FailureErrorToEnvMap = buildStep3_3FailureErrorToEnvMap(step3_3ByEnv);
-  const authzVersionByEnv = {};
-  const step3_4Result = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, authzVersionByEnv, {
-    step2ByEnv: lokiByEnv,
-  });
-  await runMandatoryFurtherAnalysisLokiChecks(step3_4Result, {
-    regionContext: activeRegion,
-  });
-  const step3_4Summary = summarizeStep3_4(step3_4Result);
-  const step3_5RecoveryByEnv = await evaluateRecoveryStatusByEnv(step3ParsedByEnv, {
-    regionContext: activeRegion,
-  });
-  const step3_4SummaryByEnvTable = buildStep3_4SummaryByEnvTable(
-    step3_4Result,
-    step2Summary,
-    step3_3ByEnv,
-    step3_5RecoveryByEnv,
-  );
-  const step3Summary = summarizeStep3Records(step3ParsedByEnv);
-  appendRunLog("STEP3.4", "Step 3.4 aggregation completed", {
-    region: activeRegion,
-    rootCauseCount: step3_4Summary.rootCauseCount,
-    furtherAnalysisCount: step3_4Summary.furtherAnalysisCount,
-    summaryByEnvRows: step3_4SummaryByEnvTable.length,
-  });
-  appendRunLog("STEP3.5", "Step 3.5 recovery check completed", {
-    region: activeRegion,
-    envCount: Object.keys(step3_5RecoveryByEnv || {}).length,
-    recoveredEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
-      x => String(x?.recoveryStatus || "") === "recovered",
-    ).length,
-    notRecoveredEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
-      x => String(x?.recoveryStatus || "") === "not_recovered",
-    ).length,
-    notSureEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
-      x => String(x?.recoveryStatus || "") === "not_sure",
-    ).length,
-  });
+    const step3ParsedByEnv = buildStep3ParsedByEnv(lokiByEnv);
+    const step3_1ValidationByEnv = buildStep3_1Validation(step3ParsedByEnv);
+    const step3_1SummaryByEnv = summarizeStep3_1Validation(step3_1ValidationByEnv);
+    const step3_2ByEnv = await buildStep3_2PreviousLogByEnv(step3_1ValidationByEnv, {
+      lookbackHours: 1,
+      regionContext: activeRegion,
+    });
+    const step3_2SummaryByEnv = summarizeStep3_2PreviousLog(step3_2ByEnv);
+    const step3_3ByEnv = await buildStep3_3CacheLoadingByEnv(step3_2ByEnv, {
+      regionContext: activeRegion,
+      envProgressTracker,
+    });
+    const step3_3SummaryByEnv = summarizeStep3_3CacheLoading(step3_3ByEnv);
+    const step3_3FailureErrorToEnvMap = buildStep3_3FailureErrorToEnvMap(step3_3ByEnv);
+    const authzVersionByEnv = {};
+    const step3_4Result = buildStep3_4DeploymentCacheCheck(step3_3ByEnv, authzVersionByEnv, {
+      step2ByEnv: lokiByEnv,
+    });
+    await runMandatoryFurtherAnalysisLokiChecks(step3_4Result, {
+      regionContext: activeRegion,
+    });
+    const step3_4Summary = summarizeStep3_4(step3_4Result);
+    const step3_5RecoveryByEnv = await evaluateRecoveryStatusByEnv(step3ParsedByEnv, {
+      regionContext: activeRegion,
+    });
+    const step3_4SummaryByEnvTable = buildStep3_4SummaryByEnvTable(
+      step3_4Result,
+      step2Summary,
+      step3_3ByEnv,
+      step3_5RecoveryByEnv,
+    );
+    const step3Summary = summarizeStep3Records(step3ParsedByEnv);
+    appendRunLog("STEP3.4", "Step 3.4 aggregation completed", {
+      region: activeRegion,
+      rootCauseCount: step3_4Summary.rootCauseCount,
+      furtherAnalysisCount: step3_4Summary.furtherAnalysisCount,
+      summaryByEnvRows: step3_4SummaryByEnvTable.length,
+    });
+    appendRunLog("STEP3.5", "Step 3.5 recovery check completed", {
+      region: activeRegion,
+      envCount: Object.keys(step3_5RecoveryByEnv || {}).length,
+      recoveredEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
+        x => String(x?.recoveryStatus || "") === "recovered",
+      ).length,
+      notRecoveredEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
+        x => String(x?.recoveryStatus || "") === "not_recovered",
+      ).length,
+      notSureEnvCount: Object.values(step3_5RecoveryByEnv || {}).filter(
+        x => String(x?.recoveryStatus || "") === "not_sure",
+      ).length,
+    });
 
-  console.log("Step 3.1 complete.");
-  console.log("Step 3.1 summary:", step3_1SummaryByEnv);
+    console.log("Step 3.1 complete.");
+    console.log("Step 3.1 summary:", step3_1SummaryByEnv);
 
-  console.log("Step 3.2 complete.");
-  console.log("Step 3.2 summary:", step3_2SummaryByEnv);
+    console.log("Step 3.2 complete.");
+    console.log("Step 3.2 summary:", step3_2SummaryByEnv);
 
-  console.log("Step 3.3 complete.");
-  console.log("Step 3.3 summary:", step3_3SummaryByEnv);
-  console.log("Step 3.3 cache-load-failure error->env map:", step3_3FailureErrorToEnvMap);
+    console.log("Step 3.3 complete.");
+    console.log("Step 3.3 summary:", step3_3SummaryByEnv);
+    console.log("Step 3.3 cache-load-failure error->env map:", step3_3FailureErrorToEnvMap);
 
-  console.log("Step 3.4 complete.");
-  console.log("Step 3.4 summary:", step3_4Summary);
+    console.log("Step 3.4 complete.");
+    console.log("Step 3.4 summary:", step3_4Summary);
 
-  console.log("Step 3 complete.");
-  console.log("Step 3 summary:", step3Summary);
+    console.log("Step 3 complete.");
+    console.log("Step 3 summary:", step3Summary);
 
-  return {
-    region: activeRegion,
-    impactedEnvs: summary.impactedEnvs,
-    rootCauseCount: step3_4Summary.rootCauseCount,
-    furtherAnalysisCount: step3_4Summary.furtherAnalysisCount,
-    summaryRows: (step3_4SummaryByEnvTable || []).map(r => ({ region: activeRegion, ...r })),
-    furtherRows: (step3_4Result.furtherAnalysisTable || []).map(r => ({ region: activeRegion, ...r })),
-  };
+    return {
+      region: activeRegion,
+      impactedEnvs: summary.impactedEnvs,
+      rootCauseCount: step3_4Summary.rootCauseCount,
+      furtherAnalysisCount: step3_4Summary.furtherAnalysisCount,
+      summaryRows: (step3_4SummaryByEnvTable || []).map(r => ({ region: activeRegion, ...r })),
+      furtherRows: (step3_4Result.furtherAnalysisTable || []).map(r => ({ region: activeRegion, ...r })),
+    };
+  } finally {
+    ACTIVE_STEP_WINDOW_OVERRIDE_HOURS = prevStepWindowOverride;
+  }
 }
 
 if (typeof window !== "undefined") {
   (async () => {
+    let requestedRegions = [];
+    let regions = [];
+    const intervalBuckets = [];
+    const allImpactedEnvs = new Set();
+    let totalRootCauseCount = 0;
+    let totalFurtherAnalysisCount = 0;
+    let fatalError = null;
     try {
       appendRunLog("RUN", "Decision404 analysis started");
-      const requestedRegions = ANALYSIS_CONFIG.iterateAllRegions
-        ? ALL_REGIONS
-        : ANALYSIS_CONFIG.regionsToRun;
-      const regions = [...new Set((requestedRegions || []).filter(Boolean))];
+      requestedRegions = ANALYSIS_CONFIG.iterateAllRegions ? ALL_REGIONS : ANALYSIS_CONFIG.regionsToRun;
+      regions = [...new Set((requestedRegions || []).filter(Boolean))];
       const maxParallelEnvs = getMaxParallelEnvs();
+      const intervalWindows = splitStep1Windows(ANALYSIS_CONFIG.step1MaxIntervalHours || 6);
       appendRunLog("RUN", "Region plan determined", {
         iterateAllRegions: Boolean(ANALYSIS_CONFIG.iterateAllRegions),
         regionCount: regions.length,
+        intervalCount: intervalWindows.length,
+        maxIntervalHours: Number(ANALYSIS_CONFIG.step1MaxIntervalHours || 6),
         maxParallelRegions: 1,
         maxParallelEnvs,
         regions,
       });
 
-      const allSummaryRows = [];
-      const allFurtherRows = [];
-      const allImpactedEnvs = new Set();
-      let totalRootCauseCount = 0;
-      let totalFurtherAnalysisCount = 0;
-      const envProgressTracker = createEnvProgressTracker();
-      const step1ByRegion = new Map();
+      for (const intervalWindow of intervalWindows) {
+        const intervalLabel = intervalWindow.label;
+        const envProgressTracker = createEnvProgressTracker();
+        const step1ByRegion = new Map();
+        const intervalBucket = {
+          label: intervalLabel,
+          startMs: intervalWindow.startMs,
+          endMs: intervalWindow.endMs,
+          summaryRows: [],
+          furtherRows: [],
+          rootCauseCount: 0,
+          furtherAnalysisCount: 0,
+        };
+        intervalBuckets.push(intervalBucket);
 
-      appendRunLog("RUN", "Step1 pre-discovery started", {
-        regionCount: regions.length,
-        maxParallelRegions: 1,
-      });
-      const step1Results = await mapWithConcurrency(regions, 1, async (region, idx) => {
-        const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
-        if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
-        return runStep1ForRegion(region);
-      });
+        appendRunLog("RUN", "Interval processing started", {
+          intervalLabel,
+          intervalIndex: intervalWindow.index,
+          intervalStartUtc: new Date(intervalWindow.startMs).toISOString(),
+          intervalEndUtc: new Date(intervalWindow.endMs).toISOString(),
+          regionCount: regions.length,
+        });
 
-      for (let i = 0; i < step1Results.length; i += 1) {
-        const region = regions[i];
-        const step1Run = step1Results[i];
-        if (step1Run?.status === "fulfilled") {
-          const res = step1Run.value;
-          step1ByRegion.set(region, res);
-          for (const env of res?.summary?.impactedEnvs || []) allImpactedEnvs.add(env);
-          continue;
+        appendRunLog("RUN", "Step1 pre-discovery started", {
+          intervalLabel,
+          regionCount: regions.length,
+          maxParallelRegions: 1,
+        });
+        const step1Results = await mapWithConcurrency(regions, 1, async (region, idx) => {
+          const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
+          if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
+          return runStep1ForRegion(region, { step1Window: intervalWindow });
+        });
+
+        for (let i = 0; i < step1Results.length; i += 1) {
+          const region = regions[i];
+          const step1Run = step1Results[i];
+          if (step1Run?.status === "fulfilled") {
+            const res = step1Run.value;
+            step1ByRegion.set(region, res);
+            for (const env of res?.summary?.impactedEnvs || []) allImpactedEnvs.add(env);
+            continue;
+          }
+
+          const step1Err = step1Run?.reason;
+          appendRunLog("RUN", "Region Step1 failed; region will be skipped", {
+            intervalLabel,
+            region,
+            error: String(step1Err?.message || step1Err),
+          });
+          console.error(`Region Step1 failed region=${region} interval=${intervalLabel}:`, step1Err);
         }
 
-        const step1Err = step1Run?.reason;
-        appendRunLog("RUN", "Region Step1 failed; region will be skipped", {
-          region,
-          error: String(step1Err?.message || step1Err),
-        });
-        console.error(`Region Step1 failed region=${region}:`, step1Err);
-      }
-
-      for (const region of regions) {
-        const step1 = step1ByRegion.get(region);
-        if (!step1) continue;
-        const p = envProgressTracker.registerRegion(region, step1.summary.impactedEnvs.length);
-        appendRunLog("RUN", "Global env progress registered for region", {
-          region,
-          regionImpactedEnvCount: step1.summary.impactedEnvs.length,
-          processedEnvCount: p.processedEnvCount,
-          totalEnvCount: p.totalEnvCount,
-          progressPct: p.progressPct,
-        });
-      }
-
-      const finalizedProgress = envProgressTracker.getProgress();
-      appendRunLog("RUN", "Global env total finalized before Step2/Step3", {
-        processedEnvCount: finalizedProgress.processedEnvCount,
-        totalEnvCount: finalizedProgress.totalEnvCount,
-        progressPct: finalizedProgress.progressPct,
-        regionsWithStep1Success: step1ByRegion.size,
-      });
-
-      const regionsForAnalysis = regions.filter(region => step1ByRegion.has(region));
-      const regionResults = await mapWithConcurrency(regionsForAnalysis, 1, async (region, idx) => {
-        const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
-        if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
-        return runDecision404AnalysisForRegion(region, {
-          envProgressTracker,
-          step1Result: step1ByRegion.get(region),
-        });
-      });
-
-      for (let i = 0; i < regionResults.length; i += 1) {
-        const region = regionsForAnalysis[i];
-        const runResult = regionResults[i];
-        if (runResult?.status === "fulfilled") {
-          const res = runResult.value;
-          totalRootCauseCount += Number(res?.rootCauseCount || 0);
-          totalFurtherAnalysisCount += Number(res?.furtherAnalysisCount || 0);
-          allSummaryRows.push(...(res?.summaryRows || []));
-          allFurtherRows.push(...(res?.furtherRows || []));
-          continue;
+        for (const region of regions) {
+          const step1 = step1ByRegion.get(region);
+          if (!step1) continue;
+          const p = envProgressTracker.registerRegion(region, step1.summary.impactedEnvs.length);
+          appendRunLog("RUN", "Global env progress registered for region", {
+            intervalLabel,
+            region,
+            regionImpactedEnvCount: step1.summary.impactedEnvs.length,
+            processedEnvCount: p.processedEnvCount,
+            totalEnvCount: p.totalEnvCount,
+            progressPct: p.progressPct,
+          });
         }
 
-        const regionErr = runResult?.reason;
-        appendRunLog("RUN", "Region analysis failed; continue with next region", {
-          region,
-          error: String(regionErr?.message || regionErr),
+        const finalizedProgress = envProgressTracker.getProgress();
+        appendRunLog("RUN", "Global env total finalized before Step2/Step3", {
+          intervalLabel,
+          processedEnvCount: finalizedProgress.processedEnvCount,
+          totalEnvCount: finalizedProgress.totalEnvCount,
+          progressPct: finalizedProgress.progressPct,
+          regionsWithStep1Success: step1ByRegion.size,
         });
-        console.error(`Region analysis failed region=${region}:`, regionErr);
-      }
 
+        const regionsForAnalysis = regions.filter(region => step1ByRegion.has(region));
+        const regionResults = await mapWithConcurrency(regionsForAnalysis, 1, async (region, idx) => {
+          const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
+          if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
+          return runDecision404AnalysisForRegion(region, {
+            envProgressTracker,
+            step1Result: step1ByRegion.get(region),
+            step1Window: intervalWindow,
+          });
+        });
+
+        for (let i = 0; i < regionResults.length; i += 1) {
+          const region = regionsForAnalysis[i];
+          const runResult = regionResults[i];
+          if (runResult?.status === "fulfilled") {
+            const res = runResult.value;
+            intervalBucket.rootCauseCount += Number(res?.rootCauseCount || 0);
+            intervalBucket.furtherAnalysisCount += Number(res?.furtherAnalysisCount || 0);
+            intervalBucket.summaryRows.push(...(res?.summaryRows || []));
+            intervalBucket.furtherRows.push(...(res?.furtherRows || []));
+            continue;
+          }
+
+          const regionErr = runResult?.reason;
+          appendRunLog("RUN", "Region analysis failed; continue with next region", {
+            intervalLabel,
+            region,
+            error: String(regionErr?.message || regionErr),
+          });
+          console.error(`Region analysis failed region=${region} interval=${intervalLabel}:`, regionErr);
+        }
+
+        totalRootCauseCount += intervalBucket.rootCauseCount;
+        totalFurtherAnalysisCount += intervalBucket.furtherAnalysisCount;
+        appendRunLog("RUN", "Interval processing completed", {
+          intervalLabel,
+          rootCauseCount: intervalBucket.rootCauseCount,
+          furtherAnalysisCount: intervalBucket.furtherAnalysisCount,
+          summaryByEnvRows: intervalBucket.summaryRows.length,
+          furtherRows: intervalBucket.furtherRows.length,
+        });
+      }
+    } catch (e) {
+      fatalError = e;
+      appendRunLog("RUN", "Decision404 analysis failed", { error: String(e?.message || e) });
+    } finally {
       try {
-        const saveRes = await saveEnvListTxtFromStep1([...allImpactedEnvs], "EnvList.txt");
-        console.log("Step 1 EnvList.txt export:", saveRes);
-      } catch (e) {
-        console.error("Step 1 EnvList.txt export failed:", e);
-      }
+        try {
+          const saveRes = await saveEnvListTxtFromStep1([...allImpactedEnvs], "EnvList.txt");
+          console.log("Step 1 EnvList.txt export:", saveRes);
+        } catch (e) {
+          console.error("Step 1 EnvList.txt export failed:", e);
+        }
 
-      const runLogContent =
-        [
-          "Decision404 Analysis Run Log",
-          `generatedAtUtc=${new Date().toISOString()}`,
-          `rootCauseCount=${totalRootCauseCount}`,
-          `furtherAnalysisCount=${totalFurtherAnalysisCount}`,
-          `regionCount=${regions.length}`,
-          "",
-          ...RUN_LOG_LINES,
-        ].join("\n") + "\n";
+        const csvFiles = [];
+        for (const bucket of intervalBuckets) {
+          csvFiles.push({
+            suggestedName: `decision404_summary_by_env_${bucket.label}.csv`,
+            content: rowsToCsv(bucket.summaryRows),
+          });
+          csvFiles.push({
+            suggestedName: `decision404_further_analysis_table_${bucket.label}.csv`,
+            content: rowsToCsv(bucket.furtherRows),
+          });
+        }
 
-      const csvFiles = [
-        {
-          suggestedName: "decision404_summary_by_env.csv",
-          content: rowsToCsv(allSummaryRows),
-        },
-        {
-          suggestedName: "decision404_further_analysis_table.csv",
-          content: rowsToCsv(allFurtherRows),
-        },
-        {
+        const runLogContent =
+          [
+            "Decision404 Analysis Run Log",
+            `generatedAtUtc=${new Date().toISOString()}`,
+            `rootCauseCount=${totalRootCauseCount}`,
+            `furtherAnalysisCount=${totalFurtherAnalysisCount}`,
+            `regionCount=${regions.length}`,
+            `intervalCount=${intervalBuckets.length}`,
+            "",
+            ...RUN_LOG_LINES,
+          ].join("\n") + "\n";
+
+        csvFiles.push({
           suggestedName: "decision404_analysis_run.log",
           content: runLogContent,
-        },
-      ];
-      appendRunLog("RUN", "Export panel opened", {
-        files: csvFiles.map(f => f.suggestedName),
-        regionCount: regions.length,
-      });
-      showCsvSavePanel(csvFiles);
-    } catch (e) {
-      appendRunLog("RUN", "Decision404 analysis failed", { error: String(e?.message || e) });
-      console.error("Decision 404 analysis failed:", e);
+        });
+        appendRunLog("RUN", "Export panel opened", {
+          files: csvFiles.map(f => f.suggestedName),
+          regionCount: regions.length,
+          intervalCount: intervalBuckets.length,
+        });
+        showCsvSavePanel(csvFiles);
+      } catch (finalizeErr) {
+        appendRunLog("RUN", "Final export failed", { error: String(finalizeErr?.message || finalizeErr) });
+        console.error("Decision 404 export failed:", finalizeErr);
+      }
+      if (fatalError) {
+        console.error("Decision 404 analysis failed:", fatalError);
+      }
     }
   })();
 }
