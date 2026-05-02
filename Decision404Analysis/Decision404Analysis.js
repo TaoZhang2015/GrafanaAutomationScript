@@ -28,7 +28,7 @@ const ANALYSIS_CONFIG = {
   grafanaRetryMaxAttempts: 3,
   grafanaRetryBaseDelayMs: 300,
   step1RangeStartPst: "2026-04-27T00:00:00-00:00",
-  step1RangeEndPst: "2026-04-27T01:59:59-00:00",
+  step1RangeEndPst: "2026-05-02T23:59:59-00:00",
   step1MaxIntervalHours: 6,
   step3_3ReuseWindowMinutes: 10,
   step3_3ReuseWindowSeconds: 10,
@@ -130,6 +130,8 @@ function getMaxParallelRegions() {
 const LOG_PATTERNS = {
   cachePrepStart:
     "start loading policies, roles, role mappings for all deployments|starting to prepare decision server cache",
+  restart:
+    "starting decision server|starting authz decision server",
   runtimeCompletion:
     "completed preparing policies runtime cache|completed preparing role assignments runtime cache|updated cache for deployment '.*' with '[0-9]+' Speedle policies|updated cache for deployment '.*' with [0-9]+ Speedle Role policies",
   deploymentListDefault:
@@ -1515,6 +1517,7 @@ function buildMergedExportRowsByEnv(summaryRows = [], furtherRows = []) {
         total404: 0,
         rootCauseCount: 0,
         cache_not_ready_yet: 0,
+        authz_service_restart: 0,
         deployment_not_in_top_3_latest_deployments: 0,
         runtime_services_cache_load_failure: 0,
         root_cause_unknown: 0,
@@ -1532,6 +1535,7 @@ function buildMergedExportRowsByEnv(summaryRows = [], furtherRows = []) {
     x.total404 += toFiniteNumberOrZero(row?.total404);
     x.rootCauseCount += toFiniteNumberOrZero(row?.rootCauseCount);
     x.cache_not_ready_yet += toFiniteNumberOrZero(row?.cache_not_ready_yet);
+    x.authz_service_restart += toFiniteNumberOrZero(row?.authz_service_restart);
     x.deployment_not_in_top_3_latest_deployments += toFiniteNumberOrZero(
       row?.deployment_not_in_top_3_latest_deployments,
     );
@@ -2200,6 +2204,25 @@ function parseCachePrepStartRecord(line, lokiTsNs) {
     message: message || null,
     line: String(line || ""),
     parsed: parsed || null,
+  };
+}
+
+function parseAuthzRestartRecord(line, lokiTsNs) {
+  const parsed = extractJsonObjectFromLogLine(line);
+  const message = String(parsed?.message || parsed?.A_message || line || "");
+  const lower = message.toLowerCase();
+  if (
+    !lower.includes("starting decision server") &&
+    !lower.includes("starting authz decision server")
+  ) {
+    return null;
+  }
+  return {
+    lokiTsNs: String(lokiTsNs),
+    timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
+    level: parsed?.level ? String(parsed.level) : null,
+    message: message || null,
+    line: String(line || ""),
   };
 }
 
@@ -3255,6 +3278,79 @@ function buildFastTraceErrorSummary(category) {
   };
 }
 
+function collectRestartEvidenceEntriesForLink(link) {
+  const requestPod = String(link?.request?.pod || "").trim();
+  if (!requestPod) return [];
+  const out = [];
+  const seenTs = new Set();
+  const bundles = [
+    link?.restartEvidence?.entries,
+    link?.restartTimelineEvidence?.entries,
+  ];
+  for (const arr of bundles) {
+    if (!Array.isArray(arr)) continue;
+    for (const rec of arr) {
+      const tsNs = String(rec?.lokiTsNs || "").trim();
+      const tsNum = Number(tsNs);
+      if (!tsNs || !Number.isFinite(tsNum) || tsNum <= 0) continue;
+      const evidencePod = String(rec?.pod || requestPod).trim();
+      if (!evidencePod || evidencePod !== requestPod) continue;
+      if (seenTs.has(tsNs)) continue;
+      seenTs.add(tsNs);
+      out.push({
+        lokiTsNs: tsNs,
+        tsNsNum: tsNum,
+        pod: evidencePod,
+        timestamp: rec?.timestamp ? String(rec.timestamp) : null,
+        message: rec?.message ? String(rec.message) : null,
+        line: rec?.line ? String(rec.line) : null,
+      });
+    }
+  }
+  out.sort((a, b) => Number(a.tsNsNum) - Number(b.tsNsNum));
+  return out;
+}
+
+function findRestartWithinThresholdForRequest(link, reqTsNs, thresholdNs) {
+  const requestPod = String(link?.request?.pod || "").trim();
+  if (!requestPod) {
+    return {
+      withinThreshold: false,
+      matchedRestartTsNs: null,
+      deltaNs: null,
+      deltaSec: null,
+      evidenceCount: 0,
+    };
+  }
+  const req = Number(reqTsNs);
+  const threshold = Math.max(1, Math.floor(Number(thresholdNs) || 0));
+  if (!Number.isFinite(req) || req <= 0 || !Number.isFinite(threshold) || threshold <= 0) {
+    return {
+      withinThreshold: false,
+      matchedRestartTsNs: null,
+      deltaNs: null,
+      deltaSec: null,
+      evidenceCount: 0,
+    };
+  }
+  const entries = collectRestartEvidenceEntriesForLink(link);
+  let matched = null;
+  for (const e of entries) {
+    const ts = Number(e?.tsNsNum || 0);
+    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (ts > req) continue;
+    const deltaNs = req - ts;
+    if (deltaNs <= threshold) matched = { entry: e, deltaNs };
+  }
+  return {
+    withinThreshold: Boolean(matched),
+    matchedRestartTsNs: matched?.entry?.lokiTsNs || null,
+    deltaNs: matched ? String(Math.floor(matched.deltaNs)) : null,
+    deltaSec: matched ? Number((matched.deltaNs / 1e9).toFixed(3)) : null,
+    evidenceCount: entries.length,
+  };
+}
+
 function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
   const env = link?.request?.env;
   const pod = link?.request?.pod || null;
@@ -3441,6 +3537,15 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
     entries: [],
     query: podTimeline?.decisionTimelineExpr || null,
   };
+  const restartTimelineEntries = (podTimeline?.restartRecords || [])
+    .filter(r => Number(r?.lokiTsNs || 0) <= Number(reqTsNs))
+    .slice(-20);
+  const restartTimelineEvidence = {
+    count: restartTimelineEntries.length,
+    entries: restartTimelineEntries,
+    query: podTimeline?.decisionTimelineExpr || null,
+    source: "fast_timeline_cache",
+  };
 
   let conclusion = "cache_load_unknown";
   let reason = null;
@@ -3520,6 +3625,7 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
     failureEvidence: [],
     uniqueFailureErrors: [],
     restartEvidence,
+    restartTimelineEvidence,
     fastPathTimelineUsed: true,
   };
   return out;
@@ -3528,7 +3634,7 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
 async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = {}) {
   const byEnv = new Map();
   const windowMinutes = Math.max(1, Number(ANALYSIS_CONFIG.step3_3CacheWindowMinutes || 10));
-  const decisionTimelinePattern = `${LOG_PATTERNS.cachePrepStart}|${LOG_PATTERNS.runtimeCompletion}|${LOG_PATTERNS.deploymentListAny}`;
+  const decisionTimelinePattern = `${LOG_PATTERNS.cachePrepStart}|${LOG_PATTERNS.runtimeCompletion}|${LOG_PATTERNS.deploymentListAny}|${LOG_PATTERNS.restart}`;
   let totalDecisionTimelineQueryCount = 0;
   let totalManagementTimelineQueryCount = 0;
   let totalRebuiltCacheKeyCount = 0;
@@ -3597,6 +3703,7 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       const completionRecords = [];
       const deploymentListRecords = [];
       const defaultDeploymentEvents = [];
+      const restartRecords = [];
       for (const e of entries) {
         const recStart = parseCachePrepStartRecord(e.line, e.lokiTsNs);
         if (
@@ -3612,11 +3719,14 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
           deploymentListRecords.push(recList);
           if (recList.kind === "default") defaultDeploymentEvents.push(recList);
         }
+        const recRestart = parseAuthzRestartRecord(e.line, e.lokiTsNs);
+        if (recRestart) restartRecords.push({ ...recRestart, pod });
       }
       cachePrepStarts.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       completionRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       deploymentListRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       defaultDeploymentEvents.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+      restartRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
       const deploymentListRounds = buildDeploymentListCacheRounds(deploymentListRecords);
       const deploymentListRoundsChrono = [...deploymentListRounds].sort(
         (a, b) => Number(a?.startLokiTsNs || 0) - Number(b?.startLokiTsNs || 0),
@@ -3633,6 +3743,7 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
         deploymentListRounds,
         deploymentListRoundsChrono,
         defaultDeploymentEvents,
+        restartRecords,
       });
       appendRunLog("STEP3.TL", "decision timeline built", {
         cacheKey,
@@ -3645,6 +3756,7 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
         completionCount: completionRecords.length,
         deploymentListRecordCount: deploymentListRecords.length,
         deploymentListRoundCount: deploymentListRounds.length,
+        restartRecordCount: restartRecords.length,
       });
     }
 
@@ -3775,6 +3887,20 @@ async function analyzeStep3_3ForLink(
     };
   }
   if (!link?.matched || !Number.isFinite(runtimeCacheStartTimeNs) || runtimeCacheStartTimeNs <= 0 || runtimeCacheStartTimeNs >= reqTsNs) {
+    if (!pod) {
+      appendRunLog("STEP3.3", "missing pod in request context, skip restart lookup and mark cache_load_unknown", {
+        ...logCtx,
+        runtimeCacheStartTimeNs: Number.isFinite(runtimeCacheStartTimeNs) ? String(runtimeCacheStartTimeNs) : null,
+      });
+      return {
+        conclusion: "cache_load_unknown",
+        reason: "missing_pod_for_restart_evidence",
+        successfulDeploymentsAll: [],
+        successfulDeploymentsLatestTop3: [],
+        failureEvidence: [],
+        restartEvidence: { count: 0, entries: [], query: null, mode: "request_relative_fallback_no_step3_2_anchor" },
+      };
+    }
     const restartLookbackMinutesNoAnchor = 10;
     const restartLookbackNsNoAnchor = restartLookbackMinutesNoAnchor * 60 * 1e9;
     const restartQueryStartNsNoAnchor = Math.max(
@@ -3798,6 +3924,7 @@ async function analyzeStep3_3ForLink(
         const parsed = extractJsonObjectFromLogLine(line);
         restartEntriesNoAnchor.push({
           lokiTsNs: String(tsNs),
+          pod: pod || null,
           timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
           message: parsed?.message ? String(parsed.message) : null,
           line: String(line || ""),
@@ -4595,26 +4722,30 @@ async function analyzeStep3_3ForLink(
   const restartQueryStartNs = restartFromPreviousRoundNs == null
     ? restartBaseStartNs
     : Math.min(restartBaseStartNs, restartFromPreviousRoundNs);
-  const restartExpr =
-    `${buildDecisionSelector(env, pod)}` +
-    ` != "/live" != "/ready"` +
-    ` |~ "starting decision server|starting authz decision server"`;
-  const restartJson = await queryLokiForStep(restartExpr, {
-    startNs: restartQueryStartNs,
-    endNs,
-    direction: "BACKWARD",
-    limit: 20,
-  });
+  const restartExpr = pod
+    ? `${buildDecisionSelector(env, pod)} != "/live" != "/ready" |~ "starting decision server|starting authz decision server"`
+    : null;
+  const restartJson = restartExpr
+    ? await queryLokiForStep(restartExpr, {
+        startNs: restartQueryStartNs,
+        endNs,
+        direction: "BACKWARD",
+        limit: 20,
+      })
+    : null;
   const restartEntries = [];
-  for (const stream of restartJson?.data?.result || []) {
-    for (const [tsNs, line] of stream.values || []) {
-      const parsed = extractJsonObjectFromLogLine(line);
-      restartEntries.push({
-        lokiTsNs: String(tsNs),
-        timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
-        message: parsed?.message ? String(parsed.message) : null,
-        line: String(line || ""),
-      });
+  if (restartJson) {
+    for (const stream of restartJson?.data?.result || []) {
+      for (const [tsNs, line] of stream.values || []) {
+        const parsed = extractJsonObjectFromLogLine(line);
+        restartEntries.push({
+          lokiTsNs: String(tsNs),
+          pod: pod || null,
+          timestamp: parsed?.timestamp ? String(parsed.timestamp) : null,
+          message: parsed?.message ? String(parsed.message) : null,
+          line: String(line || ""),
+        });
+      }
     }
   }
   const restartEvidence = {
@@ -5210,6 +5341,7 @@ async function buildStep3_3CacheLoadingByEnv(
         failureEvidence: result.failureEvidence || [],
         uniqueFailureErrors: result.uniqueFailureErrors || [],
         restartEvidence: result.restartEvidence || { count: 0, entries: [], query: null },
+        restartTimelineEvidence: result.restartTimelineEvidence || { count: 0, entries: [], query: null },
         queries: result.queries || null,
         reusedFromTraceID,
         reuseMeta,
@@ -5296,9 +5428,10 @@ async function buildStep3_3CacheLoadingByEnv(
             totalEnvCount,
             progressPct: totalEnvCount > 0 ? Number((((envIdx + 1) / totalEnvCount) * 100).toFixed(2)) : 100,
           };
-    appendRunLog("STEP3.3", "env analysis progress", {
+    appendRunLog("STEP3.3", "global env analysis progress", {
       env,
       region: regionContext || null,
+      progressScope: "global_interval_envs",
       processedEnvCount: progress.processedEnvCount,
       totalEnvCount: progress.totalEnvCount,
       progressPct: progress.progressPct,
@@ -5413,6 +5546,8 @@ function buildStep3_4DeploymentCacheCheck(
   authzVersionByEnv = {},
   { step2ByEnv = {} } = {},
 ) {
+  const restartOverrideThresholdNs = 2 * 60 * 1e9;
+
   function rootCauseExpectedDirection(rootCause) {
     const x = String(rootCause || "");
     if (
@@ -5460,6 +5595,7 @@ function buildStep3_4DeploymentCacheCheck(
 
   const rootCauseTable = [];
   const furtherAnalysisTable = [];
+  const linkByCaseIdentity = new Map();
   const buildCaseIdentityKey = row =>
     [
       String(row?.env || ""),
@@ -5587,15 +5723,19 @@ function buildStep3_4DeploymentCacheCheck(
       const decisionLogCtx = {
         env,
         traceID: baseRow.traceID || null,
+        pod: baseRow.pod || null,
         traceErrorCategory: baseRow.traceErrorCategory || "unknown",
         step3_3Conclusion: baseRow.step3_3Conclusion || null,
         requestedDeploymentType: baseRow.requestedDeploymentType || null,
         requestedDeploymentID: baseRow.requestedDeploymentID || null,
         resolvedDefaultDeploymentID: baseRow.resolvedDefaultDeploymentID || null,
       };
+      const hasConcretePod = Boolean(String(baseRow.pod || "").trim());
       const restartEvidenceCount = Math.max(
-        Number(link?.restartEvidence?.count || 0),
-        Array.isArray(link?.restartEvidence?.entries) ? link.restartEvidence.entries.length : 0,
+        hasConcretePod ? Number(link?.restartEvidence?.count || 0) : 0,
+        hasConcretePod && Array.isArray(link?.restartEvidence?.entries)
+          ? link.restartEvidence.entries.length
+          : 0,
       );
       const failureEvidenceCount = Number(
         link?.failureEvidenceCount ??
@@ -5617,6 +5757,77 @@ function buildStep3_4DeploymentCacheCheck(
       const latestRoundDistinctDeploymentCount = Number(
         link?.deploymentListCacheLatestRoundDistinctDeploymentCount || 0,
       );
+      linkByCaseIdentity.set(buildCaseIdentityKey(baseRow), link);
+      const restartWithinThreshold = findRestartWithinThresholdForRequest(
+        link,
+        Number(baseRow.requestLokiTsNs || 0),
+        restartOverrideThresholdNs,
+      );
+
+      const pushRestartOverride = (resultTag, sourceTag, extra = {}) => {
+        rootCauseTable.push({
+          ...baseRow,
+          result: resultTag,
+          rootCause: "404_due_to_decision_service_restart_cache_warmup",
+        });
+        appendRunLog("STEP3.4", "root cause: authz restart within threshold preempts prior classification", {
+          ...decisionLogCtx,
+          result: resultTag,
+          rootCause: "404_due_to_decision_service_restart_cache_warmup",
+          restartOverrideSource: sourceTag,
+          restartWithinThresholdSec: Number((restartOverrideThresholdNs / 1e9).toFixed(3)),
+          restartMatchedLokiTsNs: restartWithinThreshold.matchedRestartTsNs,
+          restartDeltaSec: restartWithinThreshold.deltaSec,
+          restartEvidenceCount: restartWithinThreshold.evidenceCount,
+          ...extra,
+        });
+      };
+
+      const shouldOverrideToRestart = () => Boolean(restartWithinThreshold.withinThreshold);
+
+      const pushFurtherAnalysisOrRestart = ({ result, action = "further_analysis_required", issue = null }, logMessage, logExtra = {}) => {
+        if (shouldOverrideToRestart()) {
+          pushRestartOverride("restart_within_2m_preempts_root_cause_unknown", "root_cause_unknown", {
+            overriddenResult: result,
+            ...logExtra,
+          });
+          return;
+        }
+        const row = {
+          ...baseRow,
+          result,
+          action,
+        };
+        if (issue) row.issue = issue;
+        furtherAnalysisTable.push(row);
+        appendRunLog("STEP3.4", logMessage, {
+          ...decisionLogCtx,
+          result,
+          ...logExtra,
+        });
+      };
+
+      const pushCacheNotReadyOrRestart = ({ result, rootCause }, logMessage, logExtra = {}) => {
+        if (shouldOverrideToRestart()) {
+          pushRestartOverride("restart_within_2m_preempts_cache_not_ready", "cache_not_ready_yet", {
+            overriddenResult: result,
+            overriddenRootCause: rootCause,
+            ...logExtra,
+          });
+          return;
+        }
+        rootCauseTable.push({
+          ...baseRow,
+          result,
+          rootCause,
+        });
+        appendRunLog("STEP3.4", logMessage, {
+          ...decisionLogCtx,
+          result,
+          rootCause,
+          ...logExtra,
+        });
+      };
 
       // Step 3.3 has already concluded restart warmup with evidence for this link.
       // Classify it immediately to avoid falling through to inconclusive cache cross-check paths.
@@ -5639,17 +5850,14 @@ function buildStep3_4DeploymentCacheCheck(
 
       if (link.traceErrorSummary?.category === "runtime_services_not_found") {
         if (completionDistinctExtendCount > 3) {
-          furtherAnalysisTable.push({
-            ...baseRow,
-            result: "runtime_cache_completion_distinct_gt_3",
-            action: "further_analysis_required",
-          });
-          appendRunLog("STEP3.4", "runtime services branch used completion distinct > 3 -> further analysis", {
-            ...decisionLogCtx,
-            result: "runtime_cache_completion_distinct_gt_3",
-            completionDistinctOriginalCount: Number(link.completionDistinctOriginalCount || 0),
-            completionDistinctExtendCount,
-          });
+          pushFurtherAnalysisOrRestart(
+            { result: "runtime_cache_completion_distinct_gt_3" },
+            "runtime services branch used completion distinct > 3 -> further analysis",
+            {
+              completionDistinctOriginalCount: Number(link.completionDistinctOriginalCount || 0),
+              completionDistinctExtendCount,
+            },
+          );
           continue;
         }
         if (
@@ -5657,33 +5865,18 @@ function buildStep3_4DeploymentCacheCheck(
           Number(link.completionDistinctOriginalCount || 0) < 3 &&
           completionDistinctExtendCount === 3
         ) {
-          if (restartWarmupLikely) {
-            rootCauseTable.push({
-              ...baseRow,
-              result: "restart_evidence_preempts_runtime_cache_not_ready_yet",
-              rootCause: "404_due_to_decision_service_restart_cache_warmup",
-            });
-            appendRunLog("STEP3.4", "restart evidence preempts runtime_cache_not_ready_yet", {
-              ...decisionLogCtx,
-              result: "restart_evidence_preempts_runtime_cache_not_ready_yet",
-              rootCause: "404_due_to_decision_service_restart_cache_warmup",
-              restartEvidenceCount: Number(link?.restartEvidence?.count || 0),
-            });
-            continue;
-          }
-          rootCauseTable.push({
-            ...baseRow,
-            result: "cache_prepare_completed_after_request_window",
-            rootCause: "404_due_to_runtime_cache_not_ready_yet",
-          });
-          appendRunLog("STEP3.4", "root cause: runtime cache completed only after extended window", {
-            ...decisionLogCtx,
-            result: "cache_prepare_completed_after_request_window",
-            rootCause: "404_due_to_runtime_cache_not_ready_yet",
-            completionDistinctOriginalCount: Number(link.completionDistinctOriginalCount || 0),
-            completionDistinctExtendCount,
-            completionExtensionUsed: Boolean(link.completionExtensionUsed),
-          });
+          pushCacheNotReadyOrRestart(
+            {
+              result: "cache_prepare_completed_after_request_window",
+              rootCause: "404_due_to_runtime_cache_not_ready_yet",
+            },
+            "root cause: runtime cache completed only after extended window",
+            {
+              completionDistinctOriginalCount: Number(link.completionDistinctOriginalCount || 0),
+              completionDistinctExtendCount,
+              completionExtensionUsed: Boolean(link.completionExtensionUsed),
+            },
+          );
           continue;
         }
         appendRunLog("STEP3.4", "runtime services branch fallthrough to standard checks", {
@@ -5714,20 +5907,6 @@ function buildStep3_4DeploymentCacheCheck(
 
       if (link.traceErrorSummary?.category === "deployment_list_not_found") {
         if (link.deploymentListCacheCheck?.decision === "target_not_ready") {
-          if (restartWarmupLikely) {
-            rootCauseTable.push({
-              ...baseRow,
-              result: "restart_evidence_preempts_deployment_list_not_ready",
-              rootCause: "404_due_to_decision_service_restart_cache_warmup",
-            });
-            appendRunLog("STEP3.4", "restart evidence preempts deployment_not_ready_in_deployment_list_cache", {
-              ...decisionLogCtx,
-              result: "restart_evidence_preempts_deployment_list_not_ready",
-              rootCause: "404_due_to_decision_service_restart_cache_warmup",
-              restartEvidenceCount: Number(link?.restartEvidence?.count || 0),
-            });
-            continue;
-          }
           if (
             String(link.deploymentListPostRequestCheck?.reason || "") ===
             "skipped_target_missing_in_last_round_with_3_distinct_deployments"
@@ -5752,17 +5931,16 @@ function buildStep3_4DeploymentCacheCheck(
           }
           if (link.deploymentListPostRequestCheck?.checked) {
             if (link.deploymentListPostRequestCheck?.foundInCheckedRounds) {
-              rootCauseTable.push({
-                ...baseRow,
-                result: "target_deployment_not_ready_in_deployment_list_cache",
-                rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-              });
-              appendRunLog("STEP3.4", "root cause: target appears only after request (post-request rounds)", {
-                ...decisionLogCtx,
-                result: "target_deployment_not_ready_in_deployment_list_cache",
-                rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-                postRequestRoundsChecked: link.deploymentListPostRequestCheck?.roundsChecked || 0,
-              });
+              pushCacheNotReadyOrRestart(
+                {
+                  result: "target_deployment_not_ready_in_deployment_list_cache",
+                  rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
+                },
+                "root cause: target appears only after request (post-request rounds)",
+                {
+                  postRequestRoundsChecked: link.deploymentListPostRequestCheck?.roundsChecked || 0,
+                },
+              );
               continue;
             }
             rootCauseTable.push({
@@ -5782,28 +5960,20 @@ function buildStep3_4DeploymentCacheCheck(
             );
             continue;
           }
-          rootCauseTable.push({
-            ...baseRow,
-            result: "target_deployment_not_ready_in_deployment_list_cache",
-            rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-          });
-          appendRunLog("STEP3.4", "root cause: target not ready in deployment list cache", {
-            ...decisionLogCtx,
-            result: "target_deployment_not_ready_in_deployment_list_cache",
-            rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-          });
+          pushCacheNotReadyOrRestart(
+            {
+              result: "target_deployment_not_ready_in_deployment_list_cache",
+              rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
+            },
+            "root cause: target not ready in deployment list cache",
+          );
           continue;
         }
         if (link.deploymentListCacheCheck?.decision !== "target_present") {
-          furtherAnalysisTable.push({
-            ...baseRow,
-            result: "deployment_list_cache_crosscheck_inconclusive",
-            action: "further_analysis_required",
-          });
-          appendRunLog("STEP3.4", "deployment list cache cross-check inconclusive -> further analysis", {
-            ...decisionLogCtx,
-            result: "deployment_list_cache_crosscheck_inconclusive",
-          });
+          pushFurtherAnalysisOrRestart(
+            { result: "deployment_list_cache_crosscheck_inconclusive" },
+            "deployment list cache cross-check inconclusive -> further analysis",
+          );
           continue;
         }
         if (link.deploymentListCacheCheck?.usedRoundTargetHitKind === "default") {
@@ -5814,32 +5984,13 @@ function buildStep3_4DeploymentCacheCheck(
             completionDistinctExtendCount >= 3 &&
             link.completionFoundAfterOriginalWindow;
           if (runtimeCacheNotReadyYetLikely) {
-            if (restartWarmupLikely) {
-              rootCauseTable.push({
-                ...baseRow,
-                result: "restart_evidence_preempts_runtime_cache_not_ready_yet",
-                rootCause: "404_due_to_decision_service_restart_cache_warmup",
-              });
-              appendRunLog("STEP3.4", "restart evidence preempts runtime_cache_not_ready_yet", {
-                ...decisionLogCtx,
-                result: "restart_evidence_preempts_runtime_cache_not_ready_yet",
-                rootCause: "404_due_to_decision_service_restart_cache_warmup",
-                restartEvidenceCount: Number(link?.restartEvidence?.count || 0),
-              });
-              continue;
-            }
-            rootCauseTable.push({
-              ...baseRow,
-              result: "cache_prepare_completed_after_request_window",
-              rootCause: "404_due_to_runtime_cache_not_ready_yet",
-            });
-            appendRunLog(
-              "STEP3.4",
-              "default-kind deployment list hit but runtime completion evidence indicates cache not ready yet",
+            pushCacheNotReadyOrRestart(
               {
-                ...decisionLogCtx,
                 result: "cache_prepare_completed_after_request_window",
                 rootCause: "404_due_to_runtime_cache_not_ready_yet",
+              },
+              "default-kind deployment list hit but runtime completion evidence indicates cache not ready yet",
+              {
                 completionDistinctOriginalCount: Number(link.completionDistinctOriginalCount || 0),
                 completionDistinctExtendCount,
                 completionExtensionUsed: Boolean(link.completionExtensionUsed),
@@ -5848,43 +5999,28 @@ function buildStep3_4DeploymentCacheCheck(
             );
             continue;
           }
-          furtherAnalysisTable.push({
-            ...baseRow,
-            result: "deployment_list_cache_hit_default_kind",
-            action: "further_analysis_required",
-          });
-          appendRunLog("STEP3.4", "deployment list hit kind=default -> further analysis", {
-            ...decisionLogCtx,
-            result: "deployment_list_cache_hit_default_kind",
-          });
+          pushFurtherAnalysisOrRestart(
+            { result: "deployment_list_cache_hit_default_kind" },
+            "deployment list hit kind=default -> further analysis",
+          );
           continue;
         }
         if (link.deploymentListCacheCheck?.usedRoundTargetHitKind === "deployment") {
           if (!link.deploymentStateCheck?.found) {
-            furtherAnalysisTable.push({
-              ...baseRow,
-              result: "deployment_state_check_missing",
-              action: "further_analysis_required",
-            });
-            appendRunLog("STEP3.4", "deployment state check missing -> further analysis", {
-              ...decisionLogCtx,
-              result: "deployment_state_check_missing",
-            });
+            pushFurtherAnalysisOrRestart(
+              { result: "deployment_state_check_missing" },
+              "deployment state check missing -> further analysis",
+            );
             continue;
           }
           if (link.deploymentStateCheck?.servingTransitionAfterCacheHitBeforeRequest === true) {
-            rootCauseTable.push({
-              ...baseRow,
-              result: "target_deployment_state_serving_transition_after_cache_round",
-              rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-            });
-            appendRunLog(
-              "STEP3.4",
-              "root cause: deployment became serving only after deployment-list cache round",
+            pushCacheNotReadyOrRestart(
               {
-                ...decisionLogCtx,
                 result: "target_deployment_state_serving_transition_after_cache_round",
                 rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
+              },
+              "root cause: deployment became serving only after deployment-list cache round",
+              {
                 cacheRoundHitLokiTsNs:
                   link.deploymentStateCheck?.cacheRoundHitLokiTsNs || null,
                 latestAtOrBeforeCacheHitNewState:
@@ -5901,31 +6037,23 @@ function buildStep3_4DeploymentCacheCheck(
             continue;
           }
           if (link.deploymentStateCheck?.isServingState !== true) {
-            rootCauseTable.push({
-              ...baseRow,
-              result: "target_deployment_state_not_serving",
-              rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-            });
-            appendRunLog("STEP3.4", "root cause: deployment state not serving", {
-              ...decisionLogCtx,
-              result: "target_deployment_state_not_serving",
-              rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-            });
+            pushCacheNotReadyOrRestart(
+              {
+                result: "target_deployment_state_not_serving",
+                rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
+              },
+              "root cause: deployment state not serving",
+            );
             continue;
           }
         }
       } else {
         // Unknown trace error category: keep both checks as guardrails.
         if (link.deploymentListCacheCheck?.decision !== "target_present") {
-          furtherAnalysisTable.push({
-            ...baseRow,
-            result: "deployment_list_cache_crosscheck_inconclusive",
-            action: "further_analysis_required",
-          });
-          appendRunLog("STEP3.4", "unknown trace category and cache check inconclusive -> further analysis", {
-            ...decisionLogCtx,
-            result: "deployment_list_cache_crosscheck_inconclusive",
-          });
+          pushFurtherAnalysisOrRestart(
+            { result: "deployment_list_cache_crosscheck_inconclusive" },
+            "unknown trace category and cache check inconclusive -> further analysis",
+          );
           continue;
         }
       }
@@ -5954,25 +6082,21 @@ function buildStep3_4DeploymentCacheCheck(
           });
           continue;
         }
-        rootCauseTable.push({
-          ...baseRow,
-          result: "cache_prepare_completed_after_request_window",
-          rootCause: "404_due_to_runtime_cache_not_ready_yet",
-        });
-        appendRunLog("STEP3.4", "root cause: extended completion evidence indicates cache not ready", {
-          ...decisionLogCtx,
-          result: "cache_prepare_completed_after_request_window",
-          rootCause: "404_due_to_runtime_cache_not_ready_yet",
-        });
+        pushCacheNotReadyOrRestart(
+          {
+            result: "cache_prepare_completed_after_request_window",
+            rootCause: "404_due_to_runtime_cache_not_ready_yet",
+          },
+          "root cause: extended completion evidence indicates cache not ready",
+        );
         continue;
       }
 
       if (uniqueCacheDeployments.length > 3) {
-        furtherAnalysisTable.push({
-          ...baseRow,
-          issue: "cache_deployment_list_gt_3",
-          action: "further_analysis_required",
-        });
+        pushFurtherAnalysisOrRestart(
+          { result: "cache_deployment_list_gt_3", issue: "cache_deployment_list_gt_3" },
+          "cache deployment list size > 3 -> further analysis",
+        );
       }
 
       if (baseRow.step3_3Conclusion !== "cache_load_success") {
@@ -6006,29 +6130,19 @@ function buildStep3_4DeploymentCacheCheck(
           });
           continue;
         }
-        furtherAnalysisTable.push({
-          ...baseRow,
-          result: "cache_load_not_success_skip_cache_membership_check",
-          action: "further_analysis_required",
-        });
-        appendRunLog("STEP3.4", "step3.3 not success -> further analysis", {
-          ...decisionLogCtx,
-          result: "cache_load_not_success_skip_cache_membership_check",
-        });
+        pushFurtherAnalysisOrRestart(
+          { result: "cache_load_not_success_skip_cache_membership_check" },
+          "step3.3 not success -> further analysis",
+        );
         continue;
       }
 
       if (reqInfo.type === "explicit") {
         if (seen.has(reqInfo.deploymentID)) {
-          furtherAnalysisTable.push({
-            ...baseRow,
-            result: "requested_deployment_found_in_cache",
-            action: "further_analysis_required",
-          });
-          appendRunLog("STEP3.4", "explicit deployment found in cache -> further analysis", {
-            ...decisionLogCtx,
-            result: "requested_deployment_found_in_cache",
-          });
+          pushFurtherAnalysisOrRestart(
+            { result: "requested_deployment_found_in_cache" },
+            "explicit deployment found in cache -> further analysis",
+          );
         } else {
           rootCauseTable.push({
             ...baseRow,
@@ -6050,25 +6164,15 @@ function buildStep3_4DeploymentCacheCheck(
       if (reqInfo.type === "default") {
         const resolvedDefaultId = baseRow.resolvedDefaultDeploymentID;
         if (!resolvedDefaultId) {
-          furtherAnalysisTable.push({
-            ...baseRow,
-            result: "default_deployment_id_not_found_in_window",
-            action: "further_analysis_required",
-          });
-          appendRunLog("STEP3.4", "default deployment id not resolved -> further analysis", {
-            ...decisionLogCtx,
-            result: "default_deployment_id_not_found_in_window",
-          });
+          pushFurtherAnalysisOrRestart(
+            { result: "default_deployment_id_not_found_in_window" },
+            "default deployment id not resolved -> further analysis",
+          );
         } else if (seen.has(resolvedDefaultId)) {
-          furtherAnalysisTable.push({
-            ...baseRow,
-            result: "default_deployment_found_in_cache",
-            action: "further_analysis_required",
-          });
-          appendRunLog("STEP3.4", "default deployment found in cache -> further analysis", {
-            ...decisionLogCtx,
-            result: "default_deployment_found_in_cache",
-          });
+          pushFurtherAnalysisOrRestart(
+            { result: "default_deployment_found_in_cache" },
+            "default deployment found in cache -> further analysis",
+          );
         } else {
           rootCauseTable.push({
             ...baseRow,
@@ -6087,15 +6191,10 @@ function buildStep3_4DeploymentCacheCheck(
         continue;
       }
 
-      furtherAnalysisTable.push({
-        ...baseRow,
-        result: "invalid_or_unexpected_url_pattern",
-        action: "further_analysis_required",
-      });
-      appendRunLog("STEP3.4", "invalid or unexpected URL pattern -> further analysis", {
-        ...decisionLogCtx,
-        result: "invalid_or_unexpected_url_pattern",
-      });
+      pushFurtherAnalysisOrRestart(
+        { result: "invalid_or_unexpected_url_pattern" },
+        "invalid or unexpected URL pattern -> further analysis",
+      );
     }
   }
 
@@ -6104,6 +6203,39 @@ function buildStep3_4DeploymentCacheCheck(
     const align = checkRootCauseTraceAlignment(row);
     if (align.aligned) {
       alignedRootCauseTable.push(row);
+      continue;
+    }
+    const mismatchLink = linkByCaseIdentity.get(buildCaseIdentityKey(row)) || null;
+    const mismatchRestartWithinThreshold = mismatchLink
+      ? findRestartWithinThresholdForRequest(
+          mismatchLink,
+          Number(row?.requestLokiTsNs || 0),
+          restartOverrideThresholdNs,
+        )
+      : {
+          withinThreshold: false,
+          matchedRestartTsNs: null,
+          deltaSec: null,
+          evidenceCount: 0,
+        };
+    if (mismatchRestartWithinThreshold.withinThreshold) {
+      alignedRootCauseTable.push({
+        ...row,
+        result: "restart_within_2m_preempts_trace_mismatch",
+        rootCause: "404_due_to_decision_service_restart_cache_warmup",
+      });
+      appendRunLog("STEP3.4", "trace/root-cause mismatch overridden by restart-within-threshold rule", {
+        env: row?.env || null,
+        traceID: row?.traceID || null,
+        requestLokiTsNs: row?.requestLokiTsNs || null,
+        previousRootCause: row?.rootCause || null,
+        result: "restart_within_2m_preempts_trace_mismatch",
+        rootCause: "404_due_to_decision_service_restart_cache_warmup",
+        restartWithinThresholdSec: Number((restartOverrideThresholdNs / 1e9).toFixed(3)),
+        restartMatchedLokiTsNs: mismatchRestartWithinThreshold.matchedRestartTsNs,
+        restartDeltaSec: mismatchRestartWithinThreshold.deltaSec,
+        restartEvidenceCount: mismatchRestartWithinThreshold.evidenceCount,
+      });
       continue;
     }
     furtherAnalysisTable.push({
@@ -6417,7 +6549,7 @@ function buildStep3_4SummaryByEnvTable(
       "deployment_not_in_top_3_latest_deployments",
     "404_due_to_deployment_not_in_top_3_latest_deployments":
       "deployment_not_in_top_3_latest_deployments",
-    "404_due_to_decision_service_restart_cache_warmup": "cache_not_ready_yet",
+    "404_due_to_decision_service_restart_cache_warmup": "authz_service_restart",
     "404_due_to_runtime_services_cache_load_failure": "runtime_services_cache_load_failure",
     "404_due_to_deployment_not_in_top_3_runtime_cache":
       "deployment_not_in_top_3_latest_deployments",
@@ -6427,6 +6559,7 @@ function buildStep3_4SummaryByEnvTable(
   };
   const summaryRootCauseColumns = [
     "cache_not_ready_yet",
+    "authz_service_restart",
     "deployment_not_in_top_3_latest_deployments",
     "runtime_services_cache_load_failure",
     "root_cause_unknown",
@@ -6491,6 +6624,7 @@ function buildStep3_4SummaryByEnvTable(
     const rawMatchedCount = Number(step2SummaryByEnv?.[env]?.matchedLineCount || 0);
     const knownRootCauseCount =
       Number(row.cache_not_ready_yet || 0) +
+      Number(row.authz_service_restart || 0) +
       Number(row.deployment_not_in_top_3_latest_deployments || 0) +
       Number(row.runtime_services_cache_load_failure || 0);
 
@@ -6500,6 +6634,7 @@ function buildStep3_4SummaryByEnvTable(
         step2MatchedLineCount: rawMatchedCount,
         knownRootCauseCount,
         cache_not_ready_yet: Number(row.cache_not_ready_yet || 0),
+        authz_service_restart: Number(row.authz_service_restart || 0),
         deployment_not_in_top_3_latest_deployments: Number(
           row.deployment_not_in_top_3_latest_deployments || 0,
         ),
@@ -6512,6 +6647,7 @@ function buildStep3_4SummaryByEnvTable(
     row.root_cause_unknown = Math.max(0, rawMatchedCount - knownRootCauseCount);
     row.rootCauseCount =
       Number(row.cache_not_ready_yet || 0) +
+      Number(row.authz_service_restart || 0) +
       Number(row.deployment_not_in_top_3_latest_deployments || 0) +
       Number(row.runtime_services_cache_load_failure || 0) +
       Number(row.root_cause_unknown || 0);
@@ -7098,6 +7234,7 @@ if (typeof window !== "undefined") {
               total404: 0,
               rootCauseCount: 0,
               cache_not_ready_yet: 0,
+              authz_service_restart: 0,
               deployment_not_in_top_3_latest_deployments: 0,
               runtime_services_cache_load_failure: 0,
               root_cause_unknown: 0,
@@ -7108,6 +7245,7 @@ if (typeof window !== "undefined") {
           acc.total404 += Number(row?.total404 || 0);
           acc.rootCauseCount += Number(row?.rootCauseCount || 0);
           acc.cache_not_ready_yet += Number(row?.cache_not_ready_yet || 0);
+          acc.authz_service_restart += Number(row?.authz_service_restart || 0);
           acc.deployment_not_in_top_3_latest_deployments += Number(
             row?.deployment_not_in_top_3_latest_deployments || 0,
           );
