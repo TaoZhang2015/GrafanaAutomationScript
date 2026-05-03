@@ -11,10 +11,18 @@
 // - parsed request records with required fields: url, traceID
 
 const RUN_LOG_LINES = [];
+let RUN_LOG_DROPPED_COUNT = 0;
 let LOKI_QUERY_SEQ = 0;
 let LAST_API_CALL_AT_MS = 0;
 let ACTIVE_STEP_WINDOW_OVERRIDE_HOURS = null;
 const STEP3_TIMELINE_BUILD_COUNT_BY_CACHE_KEY = new Map();
+const MAX_RUN_LOG_LINES = 20000;
+const RUN_LOG_LEVEL_PRIORITY = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+};
 
 // Frequently changed runtime settings
 const ANALYSIS_CONFIG = {
@@ -27,8 +35,10 @@ const ANALYSIS_CONFIG = {
   grafanaApiMinIntervalMs: 120,
   grafanaRetryMaxAttempts: 3,
   grafanaRetryBaseDelayMs: 300,
-  step1RangeStartPst: "2026-04-27T00:00:00-00:00",
-  step1RangeEndPst: "2026-05-02T23:59:59-00:00",
+  runLogLevel: "debug",
+  runLogConsoleLevel: "off",
+  step1RangeStartPst: "2026-05-01T00:00:00-00:00",
+  step1RangeEndPst: "2026-05-01T05:59:59-00:00",
   step1MaxIntervalHours: 6,
   step3_3ReuseWindowMinutes: 10,
   step3_3ReuseWindowSeconds: 10,
@@ -47,6 +57,11 @@ const ANALYSIS_CONFIG = {
   step3_3FastTimelineMinRequestsPerHour: 100,
   step3_3CacheOnlyMode: true,
   step3_3CacheWindowMinutes: 10,
+  step3_3TimelineWindowMinutes: 30,
+  step3_3TimelineShiftMinutes: 10,
+  step3_3TimelineCoverageLookbackMinutes: 10,
+  step3_3TimelineCoverageLookaheadMinutes: 10,
+  step3_3TimelineInitialLookaheadMinutes: 20,
 };
 
 const ALL_REGIONS = [
@@ -140,9 +155,35 @@ const LOG_PATTERNS = {
     "updating deployment list cache with default deploymentID|updating deployment list cache with deploymentID|new default deployment added to the cache|new deployment from latest DB records added to the cache|default deployment from latest records|default deployment from existing cached list",
 };
 
-function appendRunLog(step, message, details = null) {
+function normalizeRunLogLevel(level) {
+  const key = String(level || "").trim().toLowerCase();
+  if (RUN_LOG_LEVEL_PRIORITY[key]) return key;
+  return "info";
+}
+
+function shouldEmitRunLog(level) {
+  const configuredLevel = normalizeRunLogLevel(ANALYSIS_CONFIG.runLogLevel || "info");
+  const msgLevel = normalizeRunLogLevel(level || "info");
+  return RUN_LOG_LEVEL_PRIORITY[msgLevel] >= RUN_LOG_LEVEL_PRIORITY[configuredLevel];
+}
+
+function isRunLogDebugEnabled() {
+  return shouldEmitRunLog("debug");
+}
+
+function shouldEchoRunLogToConsole(level) {
+  const configured = String(ANALYSIS_CONFIG.runLogConsoleLevel || "off").trim().toLowerCase();
+  if (!configured || configured === "off" || configured === "none") return false;
+  return shouldEmitRunLog(level) && shouldEmitRunLog(configured);
+}
+
+function appendRunLog(step, message, details = null, level = "info") {
+  const normalizedLevel = normalizeRunLogLevel(level);
+  if (!shouldEmitRunLog(normalizedLevel)) return;
   const ts = new Date().toISOString();
-  let line = `[${ts}] [${String(step || "RUN").trim()}] ${String(message || "").trim()}`;
+  let line = `[${ts}] [${normalizedLevel.toUpperCase()}] [${String(step || "RUN").trim()}] ${String(
+    message || "",
+  ).trim()}`;
   if (details !== null && details !== undefined) {
     try {
       line += ` | ${typeof details === "string" ? details : JSON.stringify(details)}`;
@@ -151,7 +192,32 @@ function appendRunLog(step, message, details = null) {
     }
   }
   RUN_LOG_LINES.push(line);
-  console.log(line);
+  if (RUN_LOG_LINES.length > MAX_RUN_LOG_LINES + 1000) {
+    const overflow = RUN_LOG_LINES.length - MAX_RUN_LOG_LINES;
+    RUN_LOG_LINES.splice(0, overflow);
+    RUN_LOG_DROPPED_COUNT += overflow;
+  }
+  if (shouldEchoRunLogToConsole(normalizedLevel)) console.log(line);
+}
+
+function appendRunLogDebug(step, message, details = null) {
+  appendRunLog(step, message, details, "debug");
+}
+
+function appendRunLogWarn(step, message, details = null) {
+  appendRunLog(step, message, details, "warn");
+}
+
+function appendRunLogError(step, message, details = null) {
+  appendRunLog(step, message, details, "error");
+}
+
+function getRunLogLinesForExport() {
+  if (RUN_LOG_DROPPED_COUNT <= 0) return [...RUN_LOG_LINES];
+  return [
+    `[${new Date().toISOString()}] [RUN] run-log was truncated in memory; dropped oldest lines=${RUN_LOG_DROPPED_COUNT}`,
+    ...RUN_LOG_LINES,
+  ];
 }
 
 function formatNsToPst(ns) {
@@ -358,7 +424,7 @@ async function queryMimirRange(
         if (!resp.ok) {
           if (shouldRetryGrafanaStatus(resp.status) && attempt < maxAttempts - 1) {
             const delay = baseDelayMs * Math.pow(2, attempt);
-            appendRunLog("MIMIR", "retrying query_range after transient status", {
+            appendRunLogDebug("MIMIR", "retrying query_range after transient status", {
               region,
               path,
               status: resp.status,
@@ -377,7 +443,7 @@ async function queryMimirRange(
         const retryLimit = isFailedToFetchError(e) ? maxAttempts : 1;
         if (attempt < retryLimit - 1) {
           const delay = baseDelayMs * Math.pow(2, attempt);
-          appendRunLog("MIMIR", "retrying query_range after exception", {
+          appendRunLogDebug("MIMIR", "retrying query_range after exception", {
             region,
             path,
             attempt: attempt + 1,
@@ -449,7 +515,7 @@ async function queryLoki(
   const normalizedEndNs = normalizedWindow.endNs;
   const queryId = ++LOKI_QUERY_SEQ;
   const { region, config } = resolveRegionContext(regionContext);
-  appendRunLog("LOKI", "query_range start", {
+  appendRunLogDebug("LOKI", "query_range start", {
     queryId,
     region,
     direction,
@@ -518,7 +584,7 @@ async function queryLoki(
             splitDepth < MAX_SPLIT_DEPTH &&
             eNs - sNs > MIN_SPLIT_WINDOW_NS
           ) {
-            appendRunLog("LOKI", "query_range split-on-400", {
+            appendRunLogDebug("LOKI", "query_range split-on-400", {
               queryId,
               region,
               splitDepth: splitDepth + 1,
@@ -544,7 +610,7 @@ async function queryLoki(
             eNs - sNs > MIN_SPLIT_WINDOW_NS &&
             attempt === 0
           ) {
-            appendRunLog("LOKI", "query_range split-on-502-504", {
+            appendRunLogDebug("LOKI", "query_range split-on-502-504", {
               queryId,
               region,
               status: resp.status,
@@ -567,7 +633,7 @@ async function queryLoki(
 
           if (shouldRetryGrafanaStatus(resp.status) && attempt < MAX_ATTEMPTS - 1) {
             const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-            appendRunLog("LOKI", "query_range retry after transient status", {
+            appendRunLogDebug("LOKI", "query_range retry after transient status", {
               queryId,
               region,
               path,
@@ -588,7 +654,7 @@ async function queryLoki(
         const retryLimit = isFailedToFetchError(e) ? MAX_ATTEMPTS : 1;
         if (attempt < retryLimit - 1) {
           const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-          appendRunLog("LOKI", "query_range retry after exception", {
+          appendRunLogDebug("LOKI", "query_range retry after exception", {
             queryId,
             region,
             path,
@@ -610,7 +676,7 @@ async function queryLoki(
   for (const path of candidatePaths) {
     try {
       const out = await fetchPathWithSplit(path, normalizedStartNs, normalizedEndNs, 0);
-      appendRunLog("LOKI", "query_range success", {
+      appendRunLogDebug("LOKI", "query_range success", {
         queryId,
         region,
         path,
@@ -620,7 +686,7 @@ async function queryLoki(
       });
       return out;
     } catch (e) {
-      appendRunLog("LOKI", "query_range path failed", {
+      appendRunLogWarn("LOKI", "query_range path failed", {
         queryId,
         region,
         path,
@@ -631,7 +697,7 @@ async function queryLoki(
     }
   }
 
-  appendRunLog("LOKI", "query_range failed", {
+  appendRunLogError("LOKI", "query_range failed", {
     queryId,
     region,
     startPst: formatNsToPst(normalizedStartNs),
@@ -663,7 +729,7 @@ async function queryLokiInstant(expr, { timeNs, regionContext = null } = {}) {
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       try {
-        appendRunLog("LOKI", "instant query start", {
+        appendRunLogDebug("LOKI", "instant query start", {
           region,
           path,
           attempt: attempt + 1,
@@ -677,7 +743,7 @@ async function queryLokiInstant(expr, { timeNs, regionContext = null } = {}) {
         if (!resp.ok) {
           if (shouldRetryGrafanaStatus(resp.status) && attempt < MAX_ATTEMPTS - 1) {
             const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-            appendRunLog("LOKI", "instant query retry after transient status", {
+            appendRunLogDebug("LOKI", "instant query retry after transient status", {
               region,
               path,
               status: resp.status,
@@ -694,7 +760,7 @@ async function queryLokiInstant(expr, { timeNs, regionContext = null } = {}) {
           );
         }
         const out = await resp.json();
-        appendRunLog("LOKI", "instant query success", {
+        appendRunLogDebug("LOKI", "instant query success", {
           region,
           path,
           timeNs: String(actualTimeNs),
@@ -708,7 +774,7 @@ async function queryLokiInstant(expr, { timeNs, regionContext = null } = {}) {
         const retryLimit = isFailedToFetchError(e) ? MAX_ATTEMPTS : 1;
         if (attempt < retryLimit - 1) {
           const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
-          appendRunLog("LOKI", "instant query retry after exception", {
+          appendRunLogDebug("LOKI", "instant query retry after exception", {
             region,
             path,
             attempt: attempt + 1,
@@ -793,7 +859,7 @@ async function fetchLokiEntriesWithAutoSplitOnLimit(
       return collectLokiEntriesSortedAsc(json);
     }
     const midNs = Math.floor((Number(sNs) + Number(eNs)) / 2);
-    appendRunLog(logStep, "auto-split timeline query due to limit-hit risk", {
+    appendRunLogDebug(logStep, "auto-split timeline query due to limit-hit risk", {
       ...logContext,
       depth: depth + 1,
       limit,
@@ -1020,7 +1086,7 @@ async function evaluateRecoveryStatusByEnv(step3ParsedByEnv, { regionContext = n
         recoverySecondHalfWindowEndNs: null,
         recoveryQueryError: String(e?.message || e),
       };
-      appendRunLog("STEP3.5", "recovery check failed for env", {
+      appendRunLogError("STEP3.5", "recovery check failed for env", {
         env,
         startNs: String(startNs),
         endNs: String(endNs),
@@ -1217,7 +1283,7 @@ async function collectDecision404LogsForEnvWithAutoSplit(
     let metricCountQueryAttempted = false;
     let metricCountQuerySucceeded = false;
     if (unsplittableLimitHit) {
-      appendRunLog("STEP2", "warning: potential missing log entries due to step2 limit-hit leaf", {
+      appendRunLogWarn("STEP2", "warning: potential missing log entries due to step2 limit-hit leaf", {
         env,
         depth,
         limit,
@@ -1272,7 +1338,7 @@ async function collectDecision404LogsForEnvWithAutoSplit(
             metricExpr,
           });
           if (!metricCountQuerySucceeded) {
-            appendRunLog("STEP2", "warning: metric fallback query returned unparsable value", {
+            appendRunLogWarn("STEP2", "warning: metric fallback query returned unparsable value", {
               env,
               depth,
               startNs: String(sNs),
@@ -1284,7 +1350,7 @@ async function collectDecision404LogsForEnvWithAutoSplit(
             });
           }
         } catch (metricErr) {
-          appendRunLog("STEP2", "metric fallback query for unsplittable limit-hit leaf failed", {
+          appendRunLogWarn("STEP2", "metric fallback query for unsplittable limit-hit leaf failed", {
             env,
             depth,
             startNs: String(sNs),
@@ -1616,6 +1682,80 @@ async function saveFileContent({ suggestedName, content }) {
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
+function collectCsvHeaders(rows) {
+  const headers = [];
+  const seen = new Set();
+  for (const row of rows || []) {
+    for (const key of Object.keys(row || {})) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        headers.push(key);
+      }
+    }
+  }
+  return headers;
+}
+
+function buildCsvLineForRow(row, headers) {
+  const vals = headers.map(h => escapeCsvValue(normalizeCsvCell(row?.[h])));
+  return vals.join(",");
+}
+
+async function saveRowsAsCsvFile({ suggestedName, rows }) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (typeof window !== "undefined" && typeof window.showSaveFilePicker === "function") {
+    const fileHandle = await window.showSaveFilePicker({
+      suggestedName,
+      types: [{ description: "CSV File", accept: { "text/csv": [".csv"] } }],
+    });
+    const writable = await fileHandle.createWritable();
+    if (!list.length) {
+      await writable.write("no_data\n");
+      await writable.close();
+      return;
+    }
+    const headers = collectCsvHeaders(list);
+    await writable.write(headers.map(escapeCsvValue).join(",") + "\n");
+    const CHUNK_TARGET_BYTES = 1024 * 1024;
+    let chunk = "";
+    for (const row of list) {
+      chunk += buildCsvLineForRow(row, headers) + "\n";
+      if (chunk.length >= CHUNK_TARGET_BYTES) {
+        await writable.write(chunk);
+        chunk = "";
+      }
+    }
+    if (chunk) await writable.write(chunk);
+    await writable.close();
+    return;
+  }
+  await saveFileContent({ suggestedName, content: rowsToCsv(list) });
+}
+
+async function saveLinesAsTextFile({ suggestedName, lines }) {
+  const list = Array.isArray(lines) ? lines : [];
+  if (typeof window !== "undefined" && typeof window.showSaveFilePicker === "function") {
+    const fileHandle = await window.showSaveFilePicker({
+      suggestedName,
+      types: [{ description: "Text File", accept: { "text/plain": [".log", ".txt"] } }],
+    });
+    const writable = await fileHandle.createWritable();
+    const CHUNK_TARGET_BYTES = 1024 * 1024;
+    let chunk = "";
+    for (const line of list) {
+      chunk += String(line || "") + "\n";
+      if (chunk.length >= CHUNK_TARGET_BYTES) {
+        await writable.write(chunk);
+        chunk = "";
+      }
+    }
+    if (chunk) await writable.write(chunk);
+    await writable.close();
+    return;
+  }
+  await saveFileContent({ suggestedName, content: list.join("\n") + "\n" });
+}
+
 function showCsvSavePanel(files) {
   if (typeof document === "undefined") return;
   const panelId = "decision404-csv-save-panel";
@@ -1655,7 +1795,11 @@ function showCsvSavePanel(files) {
     btn.style.cursor = "pointer";
     btn.addEventListener("click", async () => {
       try {
-        await saveFileContent(f);
+        if (typeof f?.save === "function") {
+          await f.save();
+        } else {
+          await saveFileContent(f);
+        }
       } catch (e) {
         console.error(`Failed saving ${f.suggestedName}:`, e);
       }
@@ -2313,7 +2457,7 @@ async function buildStep3_2PreviousLogByEnv(
       });
       const anchorPrefetchLineCount = countLokiResultLines(lokiJson);
       if (anchorPrefetchLineCount >= 3000) {
-        appendRunLog("STEP3.2", "warning: pod anchor prefetch may be truncated due to limit-hit risk", {
+        appendRunLogWarn("STEP3.2", "warning: pod anchor prefetch may be truncated due to limit-hit risk", {
           env,
           pod: pod || null,
           limit: 3000,
@@ -3633,12 +3777,25 @@ function fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline) {
 
 async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = {}) {
   const byEnv = new Map();
-  const windowMinutes = Math.max(1, Number(ANALYSIS_CONFIG.step3_3CacheWindowMinutes || 10));
+  const timelineWindowMinutes = Math.max(
+    1,
+    Number(ANALYSIS_CONFIG.step3_3TimelineWindowMinutes || 30),
+  );
+  const coverageLookbackMinutes = Math.max(
+    1,
+    Number(ANALYSIS_CONFIG.step3_3TimelineCoverageLookbackMinutes || 10),
+  );
+  const initialLookaheadMinutes = Math.max(
+    coverageLookbackMinutes,
+    Number(ANALYSIS_CONFIG.step3_3TimelineInitialLookaheadMinutes || 20),
+  );
   const decisionTimelinePattern = `${LOG_PATTERNS.cachePrepStart}|${LOG_PATTERNS.runtimeCompletion}|${LOG_PATTERNS.deploymentListAny}|${LOG_PATTERNS.restart}`;
   let totalDecisionTimelineQueryCount = 0;
   let totalManagementTimelineQueryCount = 0;
   let totalRebuiltCacheKeyCount = 0;
   let totalPodTimelineCount = 0;
+  let totalPodWindowShiftCount = 0;
+  let totalManagementWindowShiftCount = 0;
 
   for (const [env, item] of Object.entries(step3_2ByEnv || {})) {
     const links = item?.links || [];
@@ -3657,16 +3814,19 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
     }
     if (!Number.isFinite(minReqTs) || !Number.isFinite(maxReqTs)) continue;
 
-    const podTimelines = new Map();
     let envDecisionTimelineQueryCount = 0;
+    let envManagementTimelineQueryCount = 0;
     let envRebuiltCacheKeyCount = 0;
+    let envPodWindowShiftCount = 0;
+    let envManagementWindowShiftCount = 0;
+    const podTimelines = new Map();
     for (const [pod, reqList] of podToReqTs.entries()) {
       const cacheKey = `${env}|${pod}`;
       const builtCount = Number(STEP3_TIMELINE_BUILD_COUNT_BY_CACHE_KEY.get(cacheKey) || 0) + 1;
       STEP3_TIMELINE_BUILD_COUNT_BY_CACHE_KEY.set(cacheKey, builtCount);
       if (builtCount > 1) {
         envRebuiltCacheKeyCount += 1;
-        appendRunLog("STEP3.TL", "warning: moving-window cache key rebuilt", {
+        appendRunLogWarn("STEP3.TL", "warning: moving-window cache key rebuilt", {
           cacheKey,
           env,
           pod,
@@ -3675,19 +3835,18 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
         });
       }
       let podMin = reqList[0];
-      let podMax = reqList[0];
       for (let i = 1; i < reqList.length; i += 1) {
         if (reqList[i] < podMin) podMin = reqList[i];
-        if (reqList[i] > podMax) podMax = reqList[i];
       }
-      const startNs = Math.max(0, Math.floor(podMin - windowMinutes * 60 * 1e9));
-      const endNs = Math.floor(podMax + windowMinutes * 60 * 1e9);
+      const sortedRequestTsNs = [...reqList].sort((a, b) => a - b);
+      const windowStartNs = Math.max(0, Math.floor(podMin - coverageLookbackMinutes * 60 * 1e9));
+      const windowEndNs = Math.floor(windowStartNs + timelineWindowMinutes * 60 * 1e9);
       const decisionTimelineExpr =
         `${buildDecisionSelector(env, pod)}` +
         ` != "/live" != "/ready" |~ "${decisionTimelinePattern}"`;
       const entries = await fetchLokiEntriesWithAutoSplitOnLimit(decisionTimelineExpr, {
-        startNs,
-        endNs,
+        startNs: windowStartNs,
+        endNs: windowEndNs,
         direction: "FORWARD",
         limit: 3000,
         regionContext,
@@ -3734,9 +3893,15 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       podTimelines.set(pod, {
         cacheKey,
         pod,
-        startNs,
-        endNs,
+        startNs: windowStartNs,
+        endNs: windowEndNs,
         decisionTimelineExpr,
+        sortedRequestTsNs,
+        timelineWindowMinutes,
+        coverageLookbackMinutes,
+        initialLookaheadMinutes,
+        windowLoadCount: 1,
+        windowShiftCount: 0,
         cachePrepStarts,
         completionRecords,
         deploymentListRecords,
@@ -3749,9 +3914,11 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
         cacheKey,
         env,
         pod,
-        startNs: String(startNs),
-        endNs: String(endNs),
-        windowMinutes,
+        startNs: String(windowStartNs),
+        endNs: String(windowEndNs),
+        timelineWindowMinutes,
+        coverageLookbackMinutes,
+        initialLookaheadMinutes,
         cachePrepStartCount: cachePrepStarts.length,
         completionCount: completionRecords.length,
         deploymentListRecordCount: deploymentListRecords.length,
@@ -3760,8 +3927,8 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       });
     }
 
-    const mgmtStartNs = Math.max(0, Math.floor(minReqTs - windowMinutes * 60 * 1e9));
-    const mgmtEndNs = Math.floor(maxReqTs + windowMinutes * 60 * 1e9);
+    const mgmtStartNs = Math.max(0, Math.floor(minReqTs - coverageLookbackMinutes * 60 * 1e9));
+    const mgmtEndNs = Math.floor(mgmtStartNs + timelineWindowMinutes * 60 * 1e9);
     const managementTimelineExpr =
       `{ container=~"management", namespace="authz", prd_env="${env}" }` +
       ` != "/live" != "/ready" |~ "update deployment state successfully"`;
@@ -3777,6 +3944,7 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       logContext: { env, timeline: "management" },
     });
     totalManagementTimelineQueryCount += 1;
+    envManagementTimelineQueryCount += 1;
     const managementStateRecords = [];
     for (const e of mgmtEntries) {
       const rec = parseDeploymentStateUpdateRecord(e.line, e.lokiTsNs);
@@ -3800,12 +3968,16 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
         ? Number(((linksCoveredByPodTimeline / linksWithPodAndTs) * 100).toFixed(2))
         : 0;
     const timelineBuildStats = {
-      windowMinutes,
+      timelineWindowMinutes,
+      coverageLookbackMinutes,
+      initialLookaheadMinutes,
       dedupedLinkCount: links.length,
       podCount: podToReqTs.size,
       decisionTimelineQueryCount: envDecisionTimelineQueryCount,
-      managementTimelineQueryCount: 1,
+      managementTimelineQueryCount: envManagementTimelineQueryCount,
       rebuiltCacheKeyCount: envRebuiltCacheKeyCount,
+      podWindowShiftCount: envPodWindowShiftCount,
+      managementWindowShiftCount: envManagementWindowShiftCount,
       linksWithPodAndTs,
       linksCoveredByPodTimeline,
       linkCoveragePct: coveragePct,
@@ -3815,6 +3987,8 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       env,
       podTimelines,
       managementTimelineExpr,
+      managementWindowStartNs: mgmtStartNs,
+      managementWindowEndNs: mgmtEndNs,
       managementStateRecords,
       managementStateIndexByDeployment: buildDeploymentStateIndexByDeployment(managementStateRecords),
       timelineBuildStats,
@@ -3824,11 +3998,14 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
       env,
       startNs: String(mgmtStartNs),
       endNs: String(mgmtEndNs),
-      windowMinutes,
+      timelineWindowMinutes,
+      coverageLookbackMinutes,
       deploymentStateRecordCount: managementStateRecords.length,
       deploymentStateDeploymentCount: byEnv.get(env).managementStateIndexByDeployment.size,
       decisionTimelineQueryCount: envDecisionTimelineQueryCount,
+      managementTimelineQueryCount: envManagementTimelineQueryCount,
       rebuiltCacheKeyCount: envRebuiltCacheKeyCount,
+      managementWindowShiftCount: envManagementWindowShiftCount,
       linkCoveragePct: coveragePct,
     });
     appendRunLog("STEP3.TL", "moving-window cache build summary for env", {
@@ -3842,8 +4019,203 @@ async function buildFastTimelinesByEnv(step3_2ByEnv, { regionContext = null } = 
     totalDecisionTimelineQueryCount,
     totalManagementTimelineQueryCount,
     totalRebuiltCacheKeyCount,
+    totalPodWindowShiftCount,
+    totalManagementWindowShiftCount,
   });
   return byEnv;
+}
+
+async function ensureFastTimelineCoverageForRequest(
+  link,
+  envTimeline,
+  { regionContext = null } = {},
+) {
+  const env = String(link?.request?.env || "").trim();
+  const pod = String(link?.request?.pod || "").trim();
+  const reqTsNs = Number(link?.request?.lokiTsNs);
+  if (!envTimeline || !env || !pod || !Number.isFinite(reqTsNs) || reqTsNs <= 0) return;
+
+  const timelineWindowMinutes = Math.max(
+    1,
+    Number(ANALYSIS_CONFIG.step3_3TimelineWindowMinutes || 30),
+  );
+  const coverageLookbackMinutes = Math.max(
+    1,
+    Number(ANALYSIS_CONFIG.step3_3TimelineCoverageLookbackMinutes || 10),
+  );
+  const coverageLookaheadMinutes = Math.max(
+    1,
+    Number(ANALYSIS_CONFIG.step3_3TimelineCoverageLookaheadMinutes || 10),
+  );
+  const shiftMinutes = Math.max(
+    1,
+    Number(ANALYSIS_CONFIG.step3_3TimelineShiftMinutes || 10),
+  );
+
+  const windowNs = Math.floor(timelineWindowMinutes * 60 * 1e9);
+  const lookbackNs = Math.floor(coverageLookbackMinutes * 60 * 1e9);
+  const lookaheadNs = Math.floor(coverageLookaheadMinutes * 60 * 1e9);
+  const shiftNs = Math.max(1, Math.floor(shiftMinutes * 60 * 1e9));
+  const decisionTimelinePattern = `${LOG_PATTERNS.cachePrepStart}|${LOG_PATTERNS.runtimeCompletion}|${LOG_PATTERNS.deploymentListAny}|${LOG_PATTERNS.restart}`;
+
+  const podTimeline = envTimeline?.podTimelines?.get(pod);
+  if (!podTimeline) return;
+
+  const desiredLowNs = Math.max(0, subtractNsWithPrecisionGuard(reqTsNs, lookbackNs));
+  const desiredHighNs = Math.floor(reqTsNs + lookaheadNs);
+
+  let nextPodStartNs = Number(podTimeline?.startNs || 0);
+  let nextPodEndNs = Number(podTimeline?.endNs || 0);
+  let podShiftCount = 0;
+  while (desiredLowNs < nextPodStartNs) {
+    nextPodStartNs = Math.max(0, subtractNsWithPrecisionGuard(nextPodStartNs, shiftNs));
+    nextPodEndNs = Math.floor(nextPodStartNs + windowNs);
+    podShiftCount += 1;
+  }
+  while (desiredHighNs > nextPodEndNs) {
+    nextPodStartNs = Math.floor(nextPodStartNs + shiftNs);
+    nextPodEndNs = Math.floor(nextPodStartNs + windowNs);
+    podShiftCount += 1;
+  }
+
+  if (podShiftCount > 0) {
+    const entries = await fetchLokiEntriesWithAutoSplitOnLimit(podTimeline.decisionTimelineExpr, {
+      startNs: nextPodStartNs,
+      endNs: nextPodEndNs,
+      direction: "FORWARD",
+      limit: 3000,
+      regionContext,
+      splitMaxDepth: 12,
+      splitMinWindowMinutes: 1,
+      logStep: "STEP3.TL",
+      logContext: { env, pod, timeline: "decision", mode: "sliding" },
+    });
+
+    const cachePrepStarts = [];
+    const completionRecords = [];
+    const deploymentListRecords = [];
+    const defaultDeploymentEvents = [];
+    const restartRecords = [];
+    for (const e of entries) {
+      const recStart = parseCachePrepStartRecord(e.line, e.lokiTsNs);
+      if (
+        recStart &&
+        new RegExp(LOG_PATTERNS.cachePrepStart, "i").test(String(recStart?.message || recStart?.line || ""))
+      ) {
+        cachePrepStarts.push(recStart);
+      }
+      const recComp = parseCompletedCachePrepareRecord(e.line, e.lokiTsNs);
+      if (recComp) completionRecords.push(recComp);
+      const recList = parseDeploymentListCacheUpdateRecord(e.line, e.lokiTsNs);
+      if (recList) {
+        deploymentListRecords.push(recList);
+        if (recList.kind === "default") defaultDeploymentEvents.push(recList);
+      }
+      const recRestart = parseAuthzRestartRecord(e.line, e.lokiTsNs);
+      if (recRestart) restartRecords.push({ ...recRestart, pod });
+    }
+    cachePrepStarts.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+    completionRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+    deploymentListRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+    defaultDeploymentEvents.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+    restartRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+    const deploymentListRounds = buildDeploymentListCacheRounds(deploymentListRecords);
+    const deploymentListRoundsChrono = [...deploymentListRounds].sort(
+      (a, b) => Number(a?.startLokiTsNs || 0) - Number(b?.startLokiTsNs || 0),
+    );
+
+    podTimeline.startNs = nextPodStartNs;
+    podTimeline.endNs = nextPodEndNs;
+    podTimeline.cachePrepStarts = cachePrepStarts;
+    podTimeline.completionRecords = completionRecords;
+    podTimeline.deploymentListRecords = deploymentListRecords;
+    podTimeline.deploymentListRounds = deploymentListRounds;
+    podTimeline.deploymentListRoundsChrono = deploymentListRoundsChrono;
+    podTimeline.defaultDeploymentEvents = defaultDeploymentEvents;
+    podTimeline.restartRecords = restartRecords;
+    podTimeline.windowLoadCount = Number(podTimeline.windowLoadCount || 0) + 1;
+    podTimeline.windowShiftCount = Number(podTimeline.windowShiftCount || 0) + podShiftCount;
+
+    if (envTimeline.timelineBuildStats && typeof envTimeline.timelineBuildStats === "object") {
+      envTimeline.timelineBuildStats.decisionTimelineQueryCount =
+        Number(envTimeline.timelineBuildStats.decisionTimelineQueryCount || 0) + 1;
+      envTimeline.timelineBuildStats.podWindowShiftCount =
+        Number(envTimeline.timelineBuildStats.podWindowShiftCount || 0) + podShiftCount;
+    }
+
+    appendRunLogDebug("STEP3.TL", "decision timeline window shifted", {
+      env,
+      pod,
+      requestTsNs: String(reqTsNs),
+      shiftCount: podShiftCount,
+      nextStartNs: String(nextPodStartNs),
+      nextEndNs: String(nextPodEndNs),
+      coverageLowNs: String(desiredLowNs),
+      coverageHighNs: String(desiredHighNs),
+      timelineWindowMinutes,
+      shiftMinutes,
+      windowLoadCount: Number(podTimeline.windowLoadCount || 0),
+      windowShiftCount: Number(podTimeline.windowShiftCount || 0),
+    });
+  }
+
+  const managementExpr = envTimeline?.managementTimelineExpr || null;
+  if (!managementExpr) return;
+  let nextMgmtStartNs = Number(envTimeline?.managementWindowStartNs || 0);
+  let nextMgmtEndNs = Number(envTimeline?.managementWindowEndNs || 0);
+  let mgmtShiftCount = 0;
+  while (desiredLowNs < nextMgmtStartNs) {
+    nextMgmtStartNs = Math.max(0, subtractNsWithPrecisionGuard(nextMgmtStartNs, shiftNs));
+    nextMgmtEndNs = Math.floor(nextMgmtStartNs + windowNs);
+    mgmtShiftCount += 1;
+  }
+  while (desiredHighNs > nextMgmtEndNs) {
+    nextMgmtStartNs = Math.floor(nextMgmtStartNs + shiftNs);
+    nextMgmtEndNs = Math.floor(nextMgmtStartNs + windowNs);
+    mgmtShiftCount += 1;
+  }
+  if (mgmtShiftCount <= 0) return;
+
+  const mgmtEntries = await fetchLokiEntriesWithAutoSplitOnLimit(managementExpr, {
+    startNs: nextMgmtStartNs,
+    endNs: nextMgmtEndNs,
+    direction: "FORWARD",
+    limit: 3000,
+    regionContext,
+    splitMaxDepth: 12,
+    splitMinWindowMinutes: 1,
+    logStep: "STEP3.TL",
+    logContext: { env, timeline: "management", mode: "sliding" },
+  });
+  const managementStateRecords = [];
+  for (const e of mgmtEntries) {
+    const rec = parseDeploymentStateUpdateRecord(e.line, e.lokiTsNs);
+    if (!rec) continue;
+    managementStateRecords.push(rec);
+  }
+  managementStateRecords.sort((a, b) => Number(a?.lokiTsNs || 0) - Number(b?.lokiTsNs || 0));
+  envTimeline.managementWindowStartNs = nextMgmtStartNs;
+  envTimeline.managementWindowEndNs = nextMgmtEndNs;
+  envTimeline.managementStateRecords = managementStateRecords;
+  envTimeline.managementStateIndexByDeployment = buildDeploymentStateIndexByDeployment(managementStateRecords);
+  if (envTimeline.timelineBuildStats && typeof envTimeline.timelineBuildStats === "object") {
+    envTimeline.timelineBuildStats.managementTimelineQueryCount =
+      Number(envTimeline.timelineBuildStats.managementTimelineQueryCount || 0) + 1;
+    envTimeline.timelineBuildStats.managementWindowShiftCount =
+      Number(envTimeline.timelineBuildStats.managementWindowShiftCount || 0) + mgmtShiftCount;
+  }
+  appendRunLogDebug("STEP3.TL", "management timeline window shifted", {
+    env,
+    requestTsNs: String(reqTsNs),
+    shiftCount: mgmtShiftCount,
+    nextStartNs: String(nextMgmtStartNs),
+    nextEndNs: String(nextMgmtEndNs),
+    coverageLowNs: String(desiredLowNs),
+    coverageHighNs: String(desiredHighNs),
+    timelineWindowMinutes,
+    shiftMinutes,
+    deploymentStateRecordCount: managementStateRecords.length,
+  });
 }
 
 async function analyzeStep3_3ForLink(
@@ -4439,7 +4811,7 @@ async function analyzeStep3_3ForLink(
     const previousRoundLookupEndNs = subtractNsWithPrecisionGuard(startNs, 1);
     if (!(Number.isFinite(previousRoundLookupEndNs) && previousRoundLookupEndNs > 0)) {
       previousRoundCompletionCheck.reason = "invalid_previous_round_lookup_window";
-      appendRunLog("STEP3.3", "warning: previous round lookup skipped due to invalid window", {
+      appendRunLogWarn("STEP3.3", "warning: previous round lookup skipped due to invalid window", {
         ...logCtx,
         startNs: String(startNs),
         previousRoundLookupEndNs: String(previousRoundLookupEndNs),
@@ -4464,7 +4836,7 @@ async function analyzeStep3_3ForLink(
         const previousRoundStartNs = Number(previousRoundAnchor?.tsNsNum || 0);
         if (!Number.isFinite(previousRoundStartNs) || previousRoundStartNs <= 0) {
           previousRoundCompletionCheck.reason = "previous_round_anchor_not_found";
-          appendRunLog("STEP3.3", "warning: previous round anchor not found", {
+          appendRunLogWarn("STEP3.3", "warning: previous round anchor not found", {
             ...logCtx,
             previousRoundLookupStartNs: String(previousRoundLookupStartNs),
             previousRoundLookupEndNs: String(previousRoundLookupEndNs),
@@ -4538,7 +4910,7 @@ async function analyzeStep3_3ForLink(
             previousRoundCompletionCheck.error = String(
               previousRoundCompletionErr?.message || previousRoundCompletionErr,
             );
-            appendRunLog("STEP3.3", "warning: previous round completion lookup failed", {
+            appendRunLogWarn("STEP3.3", "warning: previous round completion lookup failed", {
               ...logCtx,
               previousRoundStartNs: String(previousRoundStartNs),
               previousRoundEndNs: String(previousRoundLookupEndNs),
@@ -4549,7 +4921,7 @@ async function analyzeStep3_3ForLink(
       } catch (previousRoundErr) {
         previousRoundCompletionCheck.reason = "previous_round_anchor_query_failed";
         previousRoundCompletionCheck.error = String(previousRoundErr?.message || previousRoundErr);
-        appendRunLog("STEP3.3", "warning: previous round anchor lookup failed", {
+        appendRunLogWarn("STEP3.3", "warning: previous round anchor lookup failed", {
           ...logCtx,
           previousRoundLookupStartNs: String(previousRoundLookupStartNs),
           previousRoundLookupEndNs: String(previousRoundLookupEndNs),
@@ -4989,7 +5361,7 @@ async function buildStep3_3CacheLoadingByEnv(
     try {
       fastTimelineByEnv = await buildFastTimelinesByEnv(step3_2ByEnvForTimeline, { regionContext });
     } catch (e) {
-      appendRunLog("STEP3.3", "failed to build fast timelines; fallback to deep-analysis only", {
+      appendRunLogWarn("STEP3.3", "failed to build fast timelines; fallback to deep-analysis only", {
         region: regionContext || null,
         error: String(e?.message || e),
       });
@@ -5087,7 +5459,7 @@ async function buildStep3_3CacheLoadingByEnv(
           Number(ANALYSIS_CONFIG.step3_3RepeatedLinkIdentityWarnThreshold || 2),
         )
       ) {
-        appendRunLog("STEP3.3", "warning: repeated link identity observed during iteration", {
+        appendRunLogWarn("STEP3.3", "warning: repeated link identity observed during iteration", {
           env,
           processed: i + 1,
           total: links.length,
@@ -5108,7 +5480,7 @@ async function buildStep3_3CacheLoadingByEnv(
             Number(ANALYSIS_CONFIG.step3_3RepeatedTraceWarnThreshold || 2),
           )
         ) {
-          appendRunLog("STEP3.3", "warning: repeated traceID observed during iteration", {
+          appendRunLogWarn("STEP3.3", "warning: repeated traceID observed during iteration", {
             env,
             processed: i + 1,
             total: links.length,
@@ -5159,7 +5531,20 @@ async function buildStep3_3CacheLoadingByEnv(
 
       if (!result && envTimeline) {
         timelineLookupAttemptCount += 1;
-        const fastResult = fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline);
+        let fastResult = null;
+        try {
+          await ensureFastTimelineCoverageForRequest(link, envTimeline, { regionContext });
+          fastResult = fastAnalyzeStep3_3ForLinkFromTimeline(link, envTimeline);
+        } catch (timelineErr) {
+          appendRunLogWarn("STEP3.3", "timeline fast-path window refresh failed; fallback to deep-analysis/unknown", {
+            env,
+            traceID: reqTraceID || null,
+            pod: String(link?.request?.pod || "") || null,
+            requestUrl: reqUrl || null,
+            error: String(timelineErr?.message || timelineErr),
+          });
+          fastResult = null;
+        }
         if (fastResult) {
           if (fastResult.fastPathFallbackRequired) {
             timelineFastPathFallbackForLink = true;
@@ -5350,7 +5735,7 @@ async function buildStep3_3CacheLoadingByEnv(
 
       if ((i + 1) % 50 === 0) {
         console.log(`Step 3.3 env=${env} processed=${i + 1}/${links.length}`);
-        appendRunLog("STEP3.3", "progress", { env, processed: i + 1, total: links.length });
+        appendRunLog("STEP3.3", "progress", { env, processed: i + 1, total: links.length }, "info");
       }
     }
 
@@ -5435,7 +5820,7 @@ async function buildStep3_3CacheLoadingByEnv(
       processedEnvCount: progress.processedEnvCount,
       totalEnvCount: progress.totalEnvCount,
       progressPct: progress.progressPct,
-    });
+    }, "info");
 
     const movingWindowCacheCleanup = {
       env,
@@ -6721,7 +7106,7 @@ function buildStep3ParsedByEnv(step2ByEnv) {
       dedupCollapsed: dedupeRes.collapsedCount,
       invalidLineCount,
     });
-    appendRunLog("STEP3", "traceID repetition snapshot for env", {
+    appendRunLogDebug("STEP3", "traceID repetition snapshot for env", {
       env,
       dedupedRecords: dedupeRes.dedupedRecordCount,
       uniqueTraceCount: traceCounts.size,
@@ -6730,6 +7115,11 @@ function buildStep3ParsedByEnv(step2ByEnv) {
       maxTraceRepeatCount,
       repeatedTraceSamples,
     });
+
+    if (item && typeof item === "object") {
+      if (Array.isArray(item.streams)) item.streams.length = 0;
+      if (Array.isArray(item.sampleLines)) item.sampleLines.length = 0;
+    }
   }
 
   return out;
@@ -6812,7 +7202,7 @@ async function runStep1ForRegion(region, { envProgressTracker = null, step1Windo
       processedEnvCount: p.processedEnvCount,
       totalEnvCount: p.totalEnvCount,
       progressPct: p.progressPct,
-    });
+    }, "info");
   }
 
   console.log(
@@ -6822,8 +7212,10 @@ async function runStep1ForRegion(region, { envProgressTracker = null, step1Windo
     `Step 1 range (UTC): ${new Date(step1RangeStartMs).toISOString()} to ${new Date(step1RangeEndMs).toISOString()}`,
   );
   console.log("Impacted env count:", summary.impactedEnvs.length);
-  console.log("Impacted env list:", summary.impactedEnvs);
-  console.log("Per-env summary:", summary.byEnv);
+  if (isRunLogDebugEnabled()) {
+    console.log("Impacted env list:", summary.impactedEnvs);
+    console.log("Per-env summary:", summary.byEnv);
+  }
 
   return {
     region: activeRegion,
@@ -6900,7 +7292,9 @@ async function runDecision404AnalysisForRegion(
       region: activeRegion,
       envCount: Object.keys(step2Summary || {}).length,
     });
-    console.log("Step 2 summary:", step2Summary);
+    if (isRunLogDebugEnabled()) {
+      console.log("Step 2 summary:", step2Summary);
+    }
     const step2ErrorEnvs = Object.entries(lokiByEnv || {})
       .filter(([, item]) => String(item?.error || "").trim().length > 0)
       .map(([env, item]) => ({
@@ -6908,7 +7302,7 @@ async function runDecision404AnalysisForRegion(
         error: String(item?.error || ""),
       }));
     if (step2ErrorEnvs.length > 0) {
-      appendRunLog("RUN", "Region marked failed due to env-level Step2 data failures", {
+      appendRunLogError("RUN", "Region marked failed due to env-level Step2 data failures", {
         region: activeRegion,
         step2ErrorEnvCount: step2ErrorEnvs.length,
         step2ErrorEnvSample: step2ErrorEnvs.slice(0, 20),
@@ -6971,20 +7365,30 @@ async function runDecision404AnalysisForRegion(
     });
 
     console.log("Step 3.1 complete.");
-    console.log("Step 3.1 summary:", step3_1SummaryByEnv);
+    if (isRunLogDebugEnabled()) {
+      console.log("Step 3.1 summary:", step3_1SummaryByEnv);
+    }
 
     console.log("Step 3.2 complete.");
-    console.log("Step 3.2 summary:", step3_2SummaryByEnv);
+    if (isRunLogDebugEnabled()) {
+      console.log("Step 3.2 summary:", step3_2SummaryByEnv);
+    }
 
     console.log("Step 3.3 complete.");
-    console.log("Step 3.3 summary:", step3_3SummaryByEnv);
-    console.log("Step 3.3 cache-load-failure error->env map:", step3_3FailureErrorToEnvMap);
+    if (isRunLogDebugEnabled()) {
+      console.log("Step 3.3 summary:", step3_3SummaryByEnv);
+      console.log("Step 3.3 cache-load-failure error->env map:", step3_3FailureErrorToEnvMap);
+    }
 
     console.log("Step 3.4 complete.");
-    console.log("Step 3.4 summary:", step3_4Summary);
+    if (isRunLogDebugEnabled()) {
+      console.log("Step 3.4 summary:", step3_4Summary);
+    }
 
     console.log("Step 3 complete.");
-    console.log("Step 3 summary:", step3Summary);
+    if (isRunLogDebugEnabled()) {
+      console.log("Step 3 summary:", step3Summary);
+    }
 
     return {
       region: activeRegion,
@@ -7007,6 +7411,8 @@ if (typeof window !== "undefined") {
     const allImpactedEnvs = new Set();
     let totalRootCauseCount = 0;
     let totalFurtherAnalysisCount = 0;
+    const exportSummaryRows = [];
+    const exportFurtherRows = [];
     let fatalError = null;
     try {
       appendRunLog("RUN", "Decision404 analysis started");
@@ -7077,7 +7483,7 @@ if (typeof window !== "undefined") {
             region,
             error: String(step1Err?.message || step1Err),
           });
-          appendRunLog("RUN", "Region Step1 failed; region will be skipped", {
+          appendRunLogWarn("RUN", "Region Step1 failed; region will be skipped", {
             intervalLabel,
             region,
             error: String(step1Err?.message || step1Err),
@@ -7096,7 +7502,7 @@ if (typeof window !== "undefined") {
             processedEnvCount: p.processedEnvCount,
             totalEnvCount: p.totalEnvCount,
             progressPct: p.progressPct,
-          });
+          }, "info");
         }
 
         const finalizedProgress = envProgressTracker.getProgress();
@@ -7106,7 +7512,7 @@ if (typeof window !== "undefined") {
           totalEnvCount: finalizedProgress.totalEnvCount,
           progressPct: finalizedProgress.progressPct,
           regionsWithStep1Success: step1ByRegion.size,
-        });
+        }, "info");
 
         const regionsForAnalysis = regions.filter(region => step1ByRegion.has(region));
         const regionResults = await mapWithConcurrency(
@@ -7140,7 +7546,7 @@ if (typeof window !== "undefined") {
             region,
             error: String(regionErr?.message || regionErr),
           });
-          appendRunLog("RUN", "Region analysis failed; continue with next region", {
+          appendRunLogWarn("RUN", "Region analysis failed; continue with next region", {
             intervalLabel,
             region,
             error: String(regionErr?.message || regionErr),
@@ -7154,6 +7560,11 @@ if (typeof window !== "undefined") {
           step1ByRegion.size === regions.length &&
           regionResults.length === regions.length;
 
+        if (intervalBucket.isCompleteForExport) {
+          exportSummaryRows.push(...(intervalBucket.summaryRows || []));
+          exportFurtherRows.push(...(intervalBucket.furtherRows || []));
+        }
+
         totalRootCauseCount += intervalBucket.rootCauseCount;
         totalFurtherAnalysisCount += intervalBucket.furtherAnalysisCount;
         appendRunLog("RUN", "Interval processing completed", {
@@ -7166,10 +7577,13 @@ if (typeof window !== "undefined") {
           analysisFailedRegionCount: intervalBucket.analysisFailedRegions.length,
           isCompleteForExport: intervalBucket.isCompleteForExport,
         });
+
+        intervalBucket.summaryRows.length = 0;
+        intervalBucket.furtherRows.length = 0;
       }
     } catch (e) {
       fatalError = e;
-      appendRunLog("RUN", "Decision404 analysis failed", { error: String(e?.message || e) });
+      appendRunLogError("RUN", "Decision404 analysis failed", { error: String(e?.message || e) });
     } finally {
       try {
         try {
@@ -7198,8 +7612,6 @@ if (typeof window !== "undefined") {
         }
 
         const csvFiles = [];
-        const includedSummaryRows = [];
-        const includedFurtherRows = [];
         const skippedIntervalDetails = [];
         for (const bucket of intervalBuckets) {
           if (!bucket.isCompleteForExport) {
@@ -7218,12 +7630,10 @@ if (typeof window !== "undefined") {
             });
             continue;
           }
-          includedSummaryRows.push(...(bucket.summaryRows || []));
-          includedFurtherRows.push(...(bucket.furtherRows || []));
         }
 
         const summaryByEnvMap = new Map();
-        for (const row of includedSummaryRows) {
+        for (const row of exportSummaryRows) {
           const region = String(row?.region || "");
           const env = String(row?.env || "");
           const key = `${region}|${env}`;
@@ -7265,13 +7675,13 @@ if (typeof window !== "undefined") {
           if (regionCmp !== 0) return regionCmp;
           return String(a?.env || "").localeCompare(String(b?.env || ""));
         });
-        const aggregatedFurtherRows = [...includedFurtherRows];
+        const aggregatedFurtherRows = [...exportFurtherRows];
 
         appendRunLog("RUN", "CSV export prepared as two aggregated files", {
           includedIntervalCount: intervalBuckets.length - skippedIntervalDetails.length,
           skippedIntervalCount: skippedIntervalDetails.length,
           skippedIntervals: skippedIntervalDetails.map(x => x.intervalLabel),
-          summaryRowsBeforeAggregate: includedSummaryRows.length,
+          summaryRowsBeforeAggregate: exportSummaryRows.length,
           summaryRowsAfterAggregate: aggregatedSummaryRows.length,
           furtherRowsCombined: aggregatedFurtherRows.length,
         });
@@ -7282,28 +7692,37 @@ if (typeof window !== "undefined") {
 
         csvFiles.push({
           suggestedName: "decision404_summary_by_env.csv",
-          content: rowsToCsv(aggregatedSummaryRows),
+          save: () =>
+            saveRowsAsCsvFile({
+              suggestedName: "decision404_summary_by_env.csv",
+              rows: aggregatedSummaryRows,
+            }),
         });
         csvFiles.push({
           suggestedName: "decision404_further_analysis_table.csv",
-          content: rowsToCsv(aggregatedFurtherRows),
+          save: () =>
+            saveRowsAsCsvFile({
+              suggestedName: "decision404_further_analysis_table.csv",
+              rows: aggregatedFurtherRows,
+            }),
         });
-
-        const runLogContent =
-          [
-            "Decision404 Analysis Run Log",
-            `generatedAtUtc=${new Date().toISOString()}`,
-            `rootCauseCount=${totalRootCauseCount}`,
-            `furtherAnalysisCount=${totalFurtherAnalysisCount}`,
-            `regionCount=${regions.length}`,
-            `intervalCount=${intervalBuckets.length}`,
-            "",
-            ...RUN_LOG_LINES,
-          ].join("\n") + "\n";
 
         csvFiles.push({
           suggestedName: "decision404_analysis_run.log",
-          content: runLogContent,
+          save: () =>
+            saveLinesAsTextFile({
+              suggestedName: "decision404_analysis_run.log",
+              lines: [
+                "Decision404 Analysis Run Log",
+                `generatedAtUtc=${new Date().toISOString()}`,
+                `rootCauseCount=${totalRootCauseCount}`,
+                `furtherAnalysisCount=${totalFurtherAnalysisCount}`,
+                `regionCount=${regions.length}`,
+                `intervalCount=${intervalBuckets.length}`,
+                "",
+                ...getRunLogLinesForExport(),
+              ],
+            }),
         });
         appendRunLog("RUN", "Export panel opened", {
           files: csvFiles.map(f => f.suggestedName),
@@ -7312,7 +7731,7 @@ if (typeof window !== "undefined") {
         });
         showCsvSavePanel(csvFiles);
       } catch (finalizeErr) {
-        appendRunLog("RUN", "Final export failed", { error: String(finalizeErr?.message || finalizeErr) });
+        appendRunLogError("RUN", "Final export failed", { error: String(finalizeErr?.message || finalizeErr) });
         console.error("Decision 404 export failed:", finalizeErr);
       }
       if (fatalError) {
