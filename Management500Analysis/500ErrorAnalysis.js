@@ -44,7 +44,7 @@
  *
  * Outputs (CSV)
  * - management500_summary_by_env.csv
- *     Columns: region, env, url, request500Count, traceIdCount, uniqueErrorCount, recoveryStatus
+ *     Columns: region, env, url, request500Count, traceIdCount, recoveryStatus, uniqueErrorMessage
  * - management500_error_by_message.csv
  *     Columns: errorMessage, envCount, envs
  *
@@ -53,31 +53,141 @@
  * - Per-trace Loki context queries are throttled with SLEEP_MS (increase if you see 429/502).
  * - Intended to run in an authenticated Grafana browser tab (DevTools Console).
  */
-(async () => {
-  // -------------------------
-  // CONFIG
-  // -------------------------
-  const REGIONS = ['af-casablanca', 'ap-hobsonville', 'ap-hyderabad', 'ap-melbourne', 'ap-mitaka', 'ap-mumbai', 'ap-osaka', 'ap-pathumthani', 'ap-samutprakan', 'ap-silverdale', 'ap-singapore', 'ap-suwon', 'ap-sydney', 'ap-tokyo', 'ap-westtokyo', 'ca-montreal', 'ca-toronto', 'eu-amsterdam', 'eu-frankfurt', 'eu-milan', 'eu-stockholm', 'eu-zurich', 'me-abudhabi', 'me-alain', 'me-alkhobar', 'me-dubai', 'me-ibri', 'me-jeddah', 'me-riyadh', 'mx-monterrey', 'sa-riodejaneiro', 'sa-santiago', 'sa-saopaulo', 'sa-vinhedo', 'uk-cardiff', 'uk-london', 'us-ashburn', 'us-newark', 'us-phoenix'];
 
-  // Time window configuration (UTC)
-  // Format: "YYYY-MM-DD HH:mm:ss"
-  // Example requested:
-  //   2026-03-28 00:00:00  to  2026-03-30 23:59:59
-  const START_TIME_UTC = "2026-04-27 00:00:00";
-  const END_TIME_UTC   = "2026-05-02 23:59:59";
+// -------------------------
+// CONFIG (edit here)
+// -------------------------
+const REGIONS = ['af-casablanca', 'ap-hobsonville', 'ap-hyderabad', 'ap-melbourne', 'ap-mitaka', 'ap-mumbai', 'ap-osaka', 'ap-pathumthani', 'ap-samutprakan', 'ap-silverdale', 'ap-singapore', 'ap-suwon', 'ap-sydney', 'ap-tokyo', 'ap-westtokyo', 'ca-montreal', 'ca-toronto', 'eu-amsterdam', 'eu-frankfurt', 'eu-milan', 'eu-stockholm', 'eu-zurich', 'me-abudhabi', 'me-alain', 'me-alkhobar', 'me-dubai', 'me-ibri', 'me-jeddah', 'me-riyadh', 'mx-monterrey', 'sa-riodejaneiro', 'sa-santiago', 'sa-saopaulo', 'sa-vinhedo', 'uk-cardiff', 'uk-london', 'us-ashburn', 'us-newark', 'us-phoenix'];
 
-  const STEP_SEC = "300";
-  const LOKI_LIMIT = 3000;
-  const MAX_SPLIT_DEPTH = 3; // recursive window split on retriable Loki HTTP errors
-  const MIN_SPLIT_WINDOW_NS = 1000000n; // do not split below 1ms windows
-  const SPLITTABLE_HTTP_STATUS = new Set([400, 429, 500, 502, 503, 504]);
+// Time window configuration (UTC)
+// Format: "YYYY-MM-DD HH:mm:ss"
+const START_TIME_UTC = "2026-04-27 00:00:00";
+const END_TIME_UTC = "2026-04-29 23:59:59";
 
-  // Optional tag(s) included in the generated CSV filenames.
-  // Keep it short and non-sensitive; it will be "slugified" for filesystem safety.
-  const CSV_NAME_TAG = "ns_authz_fleet_faaas-prod";
+const STEP_SEC = "300";
+const LOKI_LIMIT = 3000;
+const MAX_SPLIT_DEPTH = 3; // recursive window split on retriable Loki HTTP errors
+const MIN_SPLIT_WINDOW_NS = 1000000n; // do not split below 1ms windows
+const SPLITTABLE_HTTP_STATUS = new Set([400, 429, 500, 502, 503, 504]);
+const MAX_RETRY_ATTEMPTS = 3;
+const BASE_RETRY_DELAY_MS = 300;
+const SLEEP_MS = 50; // try 250–1000ms if you still see 429/502
 
+// Optional tag(s) included in the generated CSV filenames.
+// Keep it short and non-sensitive; it will be "slugified" for filesystem safety.
+const CSV_NAME_TAG = "ns_authz_fleet_faaas-prod";
+const ENABLE_CONSOLE_TABLE_PREVIEW = false;
+const ENABLE_ENV_LIST_JSON_PRINT = false;
+
+const SKIP_EXACT = new Set([
+  "rendering response",
+  "key rolename not found",
+  "internal server error",
+]);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const shouldRetryStatus = (status) => {
+  const n = Number(status);
+  return n === 429 || (n >= 500 && n <= 599);
+};
+const isFailedToFetchError = (err) =>
+  String(err?.message || err || "").toLowerCase().includes("failed to fetch");
+
+function getGrafanaBasePath() {
+  if (typeof location === "undefined") return "";
+  return location.pathname.startsWith("/grafana/") ? "/grafana" : "";
+}
+
+function assignRequestsToMessageBuckets({
+  requestCountByTraceId,
+  noTraceRequestCount,
+  traceIdToAssignedMessage,
+} = {}) {
+  const messageStats = new Map();
+  const add = (message, traceId, reqCount) => {
+    const requestCount = Number(reqCount || 0);
+    if (requestCount <= 0) return;
+    const msg = String(message || "N/A");
+    if (!messageStats.has(msg)) {
+      messageStats.set(msg, { request500Count: 0, traceIds: new Set() });
+    }
+    const bucket = messageStats.get(msg);
+    bucket.request500Count += requestCount;
+    if (traceId) bucket.traceIds.add(traceId);
+  };
+
+  for (const [traceId, reqCountRaw] of requestCountByTraceId?.entries?.() || []) {
+    const reqCount = Number(reqCountRaw || 0);
+    if (reqCount <= 0) continue;
+    const assignedMsg = traceIdToAssignedMessage?.get?.(traceId) || "N/A";
+    add(assignedMsg, traceId, reqCount);
+  }
+  add("N/A", null, Number(noTraceRequestCount || 0));
+  return messageStats;
+}
+
+function buildSummaryRowsByEnv(traceIdsByEnvKey, urlStatsByEnvKey) {
+  return Object.entries(traceIdsByEnvKey || {})
+    .flatMap(([rk]) => {
+      const [region, env] = rk.split("/", 2);
+      const urlStats = urlStatsByEnvKey?.[rk] || new Map();
+      return [...urlStats.entries()].flatMap(([url, stat]) => {
+        const messageEntries = stat?.messageStats instanceof Map
+          ? [...stat.messageStats.entries()]
+          : [];
+        if (messageEntries.length === 0) {
+          return [{
+            region,
+            env,
+            url,
+            request500Count: Number(stat?.request500Count || 0),
+            traceIdCount: Number(stat?.traceIds?.size || 0),
+            recoveryStatus: String(stat?.recoveryStatus || "unknown"),
+            uniqueErrorMessage: "N/A",
+          }];
+        }
+        return messageEntries.map(([uniqueErrorMessage, bucket]) => ({
+          region,
+          env,
+          url,
+          request500Count: Number(bucket?.request500Count || 0),
+          traceIdCount: Number(bucket?.traceIds?.size || 0),
+          recoveryStatus: String(stat?.recoveryStatus || "unknown"),
+          uniqueErrorMessage,
+        }));
+      });
+    })
+    .sort(
+      (a, b) =>
+        a.region.localeCompare(b.region) ||
+        a.env.localeCompare(b.env) ||
+        b.request500Count - a.request500Count ||
+        a.url.localeCompare(b.url) ||
+        a.uniqueErrorMessage.localeCompare(b.uniqueErrorMessage),
+    );
+}
+
+function sumRequest500ByEnv(rows, region, env) {
+  let sum = 0;
+  for (const row of rows || []) {
+    if (row?.region === region && row?.env === env) {
+      sum += Number(row?.request500Count || 0);
+    }
+  }
+  return sum;
+}
+
+function pickAssignedMessage(urlScopedMessages, traceLevelMessages) {
+  const urlMsgs = Array.isArray(urlScopedMessages) ? urlScopedMessages : [];
+  if (urlMsgs.length > 0) return String(urlMsgs[0] || "N/A");
+  const traceMsgs = Array.isArray(traceLevelMessages) ? traceLevelMessages : [];
+  if (traceMsgs.length > 0) return String(traceMsgs[0] || "N/A");
+  return "N/A";
+}
+
+async function main() {
   // Grafana is often hosted under a subpath (e.g. /grafana). We derive it from the current page.
-  const GRAFANA_BASE = location.pathname.startsWith("/grafana/") ? "/grafana" : "";
+  const GRAFANA_BASE = getGrafanaBasePath();
   const gf = (p) => `${GRAFANA_BASE}${p}`;
 
   // Mimir query: find envs that had HTTP 500s (processed requests metric)
@@ -87,17 +197,6 @@
   const mimirUidForRegion = (r) => `mimir-${r}-1-fa`;
   const lokiUidForRegion = (r) => `loki-${r}-1-fa`;
   const envKey = (region, env) => `${region}/${env}`;
-
-  // Skip exact (case-insensitive) noise messages
-  const skipExact = new Set([
-    "rendering response",
-    "key rolename not found",
-    "internal server error",
-  ]);
-
-  // Sleep between Loki log-search requests to reduce rate-limit/502 risk
-  const SLEEP_MS = 50; // try 250–1000ms if you still see 502s
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // -------------------------
   // RUN STATUS / SUMMARY
@@ -367,7 +466,7 @@
     if (typeof obj?.error !== "string" || !obj.error.trim()) return null;
 
     const errorMsg = normalizeWs(obj.error);
-    if (skipExact.has(errorMsg.toLowerCase())) return null;
+    if (SKIP_EXACT.has(errorMsg.toLowerCase())) return null;
 
     const ora = errorMsg.match(/\bORA-(\d+)\b/i);
     if (ora) {
@@ -391,7 +490,7 @@
   function pruneContainingLongerMessages(messages) {
     const normalized = messages
       .map((m) => ({ raw: m, n: normalizeWs(m).toLowerCase() }))
-      .filter((x) => x.n && !skipExact.has(x.n));
+      .filter((x) => x.n && !SKIP_EXACT.has(x.n));
 
     const keep = normalized.filter((a, i) => {
       return !normalized.some((b, j) => {
@@ -480,6 +579,23 @@
       splitDepth = 0,
     } = {}
   ) {
+    const sumLokiLineCount = (json) => {
+      let count = 0;
+      for (const stream of json?.data?.result || []) {
+        count += Number(stream?.values?.length || 0);
+      }
+      return count;
+    };
+
+    const mergeLokiResults = (a, b) => ({
+      data: {
+        result: [
+          ...(a?.data?.result || []),
+          ...(b?.data?.result || []),
+        ],
+      },
+    });
+
     const lokiUid = lokiUidForRegion(region);
     let base = lokiBaseCache.get(lokiUid);
     if (!base) {
@@ -496,7 +612,39 @@
     }).toString();
 
     const url = `${base}/api/v1/query_range?${qs}`;
-    const resp = await fetch(url, { credentials: "include" });
+    let resp = null;
+    let lastErr = null;
+    for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        resp = await fetch(url, { credentials: "include" });
+        if (resp.ok) break;
+        const retryable = shouldRetryStatus(resp.status);
+        if (retryable && attempt < MAX_RETRY_ATTEMPTS - 1) {
+          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+          console.warn(
+            `Loki HTTP ${resp.status} region=${region}; retry=${attempt + 1}/${MAX_RETRY_ATTEMPTS} delayMs=${delay}`,
+          );
+          await sleep(delay);
+          continue;
+        }
+        break;
+      } catch (e) {
+        lastErr = e;
+        const retryable = isFailedToFetchError(e);
+        if (retryable && attempt < MAX_RETRY_ATTEMPTS - 1) {
+          const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+          console.warn(
+            `Loki fetch exception region=${region}; retry=${attempt + 1}/${MAX_RETRY_ATTEMPTS} delayMs=${delay} err=${String(
+              e?.message || e,
+            )}`,
+          );
+          await sleep(delay);
+          continue;
+        }
+        throw e;
+      }
+    }
+    if (!resp) throw lastErr || new Error(`Loki request failed for ${url} (region=${region})`);
     if (!resp.ok) {
       const windowNs = endNs - startNs;
       const canSplit = splitDepth < MAX_SPLIT_DEPTH && windowNs > MIN_SPLIT_WINDOW_NS;
@@ -531,7 +679,39 @@
       }
       throw new Error(`HTTP ${resp.status} for ${url} (region=${region})`);
     }
-    return await resp.json();
+    const out = await resp.json();
+    const lineCount = sumLokiLineCount(out);
+    const windowNs = endNs - startNs;
+    const canSplitOnLimit = splitDepth < MAX_SPLIT_DEPTH && windowNs > MIN_SPLIT_WINDOW_NS;
+    const isLimitLikelyHit = lineCount >= Number(limit || 0);
+    if (isLimitLikelyHit && canSplitOnLimit) {
+      const mid = (startNs + endNs) / 2n;
+      console.warn(
+        `Loki limit-hit risk region=${region} lineCount=${lineCount} limit=${limit}; ` +
+        `split=${splitDepth + 1}/${MAX_SPLIT_DEPTH} window=${new Date(Number(startNs / 1000000n)).toISOString()} -> ` +
+        `${new Date(Number(endNs / 1000000n)).toISOString()}`
+      );
+      const first = await queryLokiForRegion(region, expr, {
+        limit,
+        startNs,
+        endNs: mid,
+        splitDepth: splitDepth + 1,
+      });
+      const second = await queryLokiForRegion(region, expr, {
+        limit,
+        startNs: mid + 1n,
+        endNs,
+        splitDepth: splitDepth + 1,
+      });
+      return mergeLokiResults(first, second);
+    }
+    if (isLimitLikelyHit && !canSplitOnLimit) {
+      console.warn(
+        `Loki limit-hit risk unsplittable region=${region} lineCount=${lineCount} limit=${limit} ` +
+        `splitDepth=${splitDepth}/${MAX_SPLIT_DEPTH} windowNs=${String(windowNs)}`
+      );
+    }
+    return out;
   }
 
   function buildErrorToEnvKeyTable(uniqueErrorsByEnvKey) {
@@ -556,7 +736,7 @@
   // -------------------------
   const traceIdsByEnvKey = {};
   const uniqueErrorsByEnvKey = {};
-  const urlStatsByEnvKey = {}; // rk -> Map(url -> { request500Count, traceIds:Set, uniqueErrorCount:number, last500TsNs:number, recoveryStatus:string })
+  const urlStatsByEnvKey = {}; // rk -> Map(url -> { request500Count, traceIds:Set, requestCountByTraceId:Map, noTraceRequestCount:number, messageStats:Map, uniqueErrorMessages:string[], last500TsNs:number, recoveryStatus:string })
   const RECOVERY_RECENT_NOT_RECOVERED_MS = 10 * 60 * 1000; // 10 minutes
 
   try {
@@ -602,7 +782,10 @@
               {
                 request500Count: 0,
                 traceIds: new Set(),
-                uniqueErrorCount: 0,
+                requestCountByTraceId: new Map(),
+                noTraceRequestCount: 0,
+                messageStats: new Map(),
+                uniqueErrorMessages: [],
                 last500TsNs: 0,
                 recoveryStatus: "unknown",
               },
@@ -622,7 +805,10 @@
               urlStats.set(u, {
                 request500Count: 0,
                 traceIds: new Set(),
-                uniqueErrorCount: 0,
+                requestCountByTraceId: new Map(),
+                noTraceRequestCount: 0,
+                messageStats: new Map(),
+                uniqueErrorMessages: [],
                 last500TsNs: 0,
                 recoveryStatus: "unknown",
               });
@@ -630,6 +816,17 @@
             const slot = urlStats.get(u);
             slot.request500Count += 1;
             for (const id of ids) slot.traceIds.add(id);
+            if (ids.length > 0) {
+              // Assign each request row to one primary trace so per-message request counts
+              // can partition total request500Count without double counting.
+              const primaryId = ids[0];
+              slot.requestCountByTraceId.set(
+                primaryId,
+                Number(slot.requestCountByTraceId.get(primaryId) || 0) + 1,
+              );
+            } else {
+              slot.noTraceRequestCount += 1;
+            }
             const tsNum = Number(tsRaw);
             if (Number.isFinite(tsNum) && tsNum > Number(slot.last500TsNs || 0)) {
               slot.last500TsNs = tsNum;
@@ -641,7 +838,10 @@
           urlStats.set("N/A", {
             request500Count: 0,
             traceIds: new Set(traceSet),
-            uniqueErrorCount: 0,
+            requestCountByTraceId: new Map(),
+            noTraceRequestCount: 0,
+            messageStats: new Map(),
+            uniqueErrorMessages: [],
             last500TsNs: 0,
             recoveryStatus: "unknown",
           });
@@ -690,13 +890,55 @@
 
         const envUrlStats = urlStatsByEnvKey[envKey(region, env)] || new Map();
         for (const [url, stat] of envUrlStats.entries()) {
-          const displays = new Set();
-          for (const traceId of stat.traceIds || []) {
-            const ds = traceIdToErrorDisplays.get(traceId);
-            if (!ds) continue;
-            for (const d of ds) displays.add(d);
+          // Strict URL scoping: message stats are computed from Loki lines
+          // matched by BOTH traceID and this specific URL in this specific env+region.
+          const urlExprEscaped = escapeRegexLiteral(url);
+          const traceIdToAssignedMessage = new Map();
+          for (const [traceId, reqCountRaw] of stat.requestCountByTraceId.entries()) {
+            const reqCount = Number(reqCountRaw || 0);
+            if (reqCount <= 0) continue;
+            const traceMsgExpr =
+              `{container=~"management",namespace="authz",prd_env="${env}"}` +
+              ` != "/live" != "/ready" |= "${traceId}"` +
+              ` |~ \`"url"\\s*:\\s*"${urlExprEscaped}"\``;
+            let traceMsgJson;
+            try {
+              await sleep(SLEEP_MS);
+              traceMsgJson = await queryLokiForRegion(region, traceMsgExpr, { limit: LOKI_LIMIT });
+            } catch (e) {
+              summary.lokiTraceContextFailures++;
+              console.warn(
+                `Loki URL-scoped message query failed region=${region} env=${env} url=${url} traceId=${traceId}:`,
+                e,
+              );
+              continue;
+            }
+            const traceMsgKeyToDisplay = new Map();
+            for (const stream of traceMsgJson?.data?.result || []) {
+              for (const [, line] of stream.values || []) {
+                const rec = extractErrorRecordFromErrorLine(line);
+                if (!rec) continue;
+                const prev = traceMsgKeyToDisplay.get(rec.key);
+                if (!prev || rec.display.length < prev.length) {
+                  traceMsgKeyToDisplay.set(rec.key, rec.display);
+                }
+              }
+            }
+            const traceMsgs = pruneContainingLongerMessages([...traceMsgKeyToDisplay.values()]);
+            const traceLevelMsgs = pruneContainingLongerMessages(
+              [...(traceIdToErrorDisplays.get(traceId) || new Set())],
+            );
+            const assignedMsg = pickAssignedMessage(traceMsgs, traceLevelMsgs);
+            traceIdToAssignedMessage.set(traceId, assignedMsg);
           }
-          stat.uniqueErrorCount = pruneContainingLongerMessages([...displays]).length;
+
+          const messageStats = assignRequestsToMessageBuckets({
+            requestCountByTraceId: stat.requestCountByTraceId,
+            noTraceRequestCount: stat.noTraceRequestCount,
+            traceIdToAssignedMessage,
+          });
+          stat.messageStats = messageStats;
+          stat.uniqueErrorMessages = [...messageStats.keys()].sort((a, b) => a.localeCompare(b));
 
           const last500TsNs = Number(stat.last500TsNs || 0);
           if (url === "N/A" || !Number.isFinite(last500TsNs) || last500TsNs <= 0) {
@@ -704,7 +946,6 @@
             continue;
           }
 
-          const urlExprEscaped = escapeRegexLiteral(url);
           const recoverExpr =
             `{container=~"management",namespace="authz",prd_env="${env}"}` +
             ` != "/live" != "/ready"` +
@@ -745,27 +986,7 @@
     // -------------------------
     // OUTPUT TABLES
     // -------------------------
-    const envTable = Object.entries(traceIdsByEnvKey)
-      .flatMap(([rk]) => {
-        const [region, env] = rk.split("/", 2);
-        const urlStats = urlStatsByEnvKey[rk] || new Map();
-        return [...urlStats.entries()].map(([url, stat]) => ({
-          region,
-          env,
-          url,
-          request500Count: Number(stat?.request500Count || 0),
-          traceIdCount: Number(stat?.traceIds?.size || 0),
-          uniqueErrorCount: Number(stat?.uniqueErrorCount || 0),
-          recoveryStatus: String(stat?.recoveryStatus || "unknown"),
-        }));
-      })
-      .sort(
-        (a, b) =>
-          a.region.localeCompare(b.region) ||
-          a.env.localeCompare(b.env) ||
-          b.request500Count - a.request500Count ||
-          a.url.localeCompare(b.url),
-      );
+    const envTable = buildSummaryRowsByEnv(traceIdsByEnvKey, urlStatsByEnvKey);
 
     const errorTable = buildErrorToEnvKeyTable(uniqueErrorsByEnvKey);
 
@@ -786,10 +1007,12 @@
 
     showCsvSavePanel(files);
 
-    console.log("\nEnv table preview (first 20 rows):");
-    console.table(envTable.slice(0, 20));
-    console.log("\nError table preview (first 20 rows):");
-    console.table(errorTable.slice(0, 20));
+    if (ENABLE_CONSOLE_TABLE_PREVIEW) {
+      console.log("\nEnv table preview (first 20 rows):");
+      console.table(envTable.slice(0, 20));
+      console.log("\nError table preview (first 20 rows):");
+      console.table(errorTable.slice(0, 20));
+    }
 
   } catch (e) {
     summary.fatalError = e;
@@ -809,8 +1032,23 @@
 
     // Print the unique env list at the end in the requested format.
     // Note: This list includes envs discovered from Mimir in regions that were successfully queried.
-    const envArray = [...allEnvs].sort();
-    console.log("\nEnv list (unique across all regions):");
-    console.log(JSON.stringify(envArray, null, 2));
+    if (ENABLE_ENV_LIST_JSON_PRINT) {
+      const envArray = [...allEnvs].sort();
+      console.log("\nEnv list (unique across all regions):");
+      console.log(JSON.stringify(envArray, null, 2));
+    }
   }
-})();
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    assignRequestsToMessageBuckets,
+    buildSummaryRowsByEnv,
+    sumRequest500ByEnv,
+    pickAssignedMessage,
+  };
+}
+
+if (typeof window !== "undefined") {
+  main();
+}
