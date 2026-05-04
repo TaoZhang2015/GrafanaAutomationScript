@@ -35,10 +35,12 @@ const ANALYSIS_CONFIG = {
   grafanaApiMinIntervalMs: 120,
   grafanaRetryMaxAttempts: 3,
   grafanaRetryBaseDelayMs: 300,
-  runLogLevel: "debug",
+  runLogLevel: "info",
   runLogConsoleLevel: "off",
-  step1RangeStartPst: "2026-05-01T00:00:00-00:00",
-  step1RangeEndPst: "2026-05-01T05:59:59-00:00",
+  step3_2ProgressConsoleEvery: 100,
+  step3_3GlobalEnvProgressConsoleEvery: 10,
+  step1RangeStartPst: "2026-05-02T00:00:00-00:00",
+  step1RangeEndPst: "2026-05-02T23:59:59-00:00",
   step1MaxIntervalHours: 6,
   step3_3ReuseWindowMinutes: 10,
   step3_3ReuseWindowSeconds: 10,
@@ -593,6 +595,15 @@ async function queryLoki(
               startPst: formatNsToPst(sNs),
               endPst: formatNsToPst(eNs),
             });
+            appendRunLogWarn("LOKI", "query_range split-on-400", {
+              queryId,
+              region,
+              splitDepth: splitDepth + 1,
+              startNs: String(sNs),
+              endNs: String(eNs),
+              startPst: formatNsToPst(sNs),
+              endPst: formatNsToPst(eNs),
+            });
             const mid = Math.floor((sNs + eNs) / 2);
             console.warn(
               `Loki split-on-400 depth=${splitDepth + 1}: ${new Date(
@@ -611,6 +622,16 @@ async function queryLoki(
             attempt === 0
           ) {
             appendRunLogDebug("LOKI", "query_range split-on-502-504", {
+              queryId,
+              region,
+              status: resp.status,
+              splitDepth: splitDepth + 1,
+              startNs: String(sNs),
+              endNs: String(eNs),
+              startPst: formatNsToPst(sNs),
+              endPst: formatNsToPst(eNs),
+            });
+            appendRunLogWarn("LOKI", "query_range split-on-502-504", {
               queryId,
               region,
               status: resp.status,
@@ -1453,6 +1474,12 @@ async function saveTextViaManualButton({ text, suggestedName, buttonId, buttonTe
           btn.remove();
           resolve(true);
         } catch (e) {
+          appendRunLogError("EXPORT", "Manual save failed", {
+            suggestedName,
+            buttonId,
+            buttonText,
+            error: String(e?.message || e),
+          });
           console.error("Manual save failed:", e?.message || String(e));
           reject(e);
         }
@@ -1801,6 +1828,10 @@ function showCsvSavePanel(files) {
           await saveFileContent(f);
         }
       } catch (e) {
+        appendRunLogError("EXPORT", "Save from export panel failed", {
+          suggestedName: f?.suggestedName || null,
+          error: String(e?.message || e),
+        });
         console.error(`Failed saving ${f.suggestedName}:`, e);
       }
     });
@@ -1920,6 +1951,10 @@ async function collectDecision404LogsByEnv(
         },
         error: String(e?.message || e),
       };
+      appendRunLogError("STEP2", "env 404 collection failed", {
+        env,
+        error: String(e?.message || e),
+      });
       console.error(`Step 2 env=${env} failed:`, e);
     }
         return { env, throttle429 };
@@ -2553,7 +2588,15 @@ async function buildStep3_2PreviousLogByEnv(
         previousLog: found.previousLog,
       });
 
-      if ((i + 1) % 100 === 0) {
+      const step3_2ProgressConsoleEvery = Math.max(
+        0,
+        Math.floor(Number(ANALYSIS_CONFIG.step3_2ProgressConsoleEvery || 0) || 0),
+      );
+      if (
+        isRunLogDebugEnabled() &&
+        step3_2ProgressConsoleEvery > 0 &&
+        ((i + 1) % step3_2ProgressConsoleEvery === 0 || i + 1 >= requestRecords.length)
+      ) {
         console.log(`Step 3.2 env=${env} processed=${i + 1}/${requestRecords.length}`);
       }
     }
@@ -5821,6 +5864,18 @@ async function buildStep3_3CacheLoadingByEnv(
       totalEnvCount: progress.totalEnvCount,
       progressPct: progress.progressPct,
     }, "info");
+    const progressConsoleEvery = Math.max(
+      1,
+      Math.floor(Number(ANALYSIS_CONFIG.step3_3GlobalEnvProgressConsoleEvery || 10) || 10),
+    );
+    if (
+      progress.processedEnvCount % progressConsoleEvery === 0 ||
+      progress.processedEnvCount >= progress.totalEnvCount
+    ) {
+      console.log(
+        `Step 3.3 global env progress processedEnvCount=${progress.processedEnvCount}/${progress.totalEnvCount} (${progress.progressPct}%) region=${regionContext || "n/a"} env=${env}`,
+      );
+    }
 
     const movingWindowCacheCleanup = {
       env,
@@ -7488,6 +7543,11 @@ if (typeof window !== "undefined") {
             region,
             error: String(step1Err?.message || step1Err),
           });
+          appendRunLogError("RUN", "Region Step1 failed", {
+            intervalLabel,
+            region,
+            error: String(step1Err?.message || step1Err),
+          });
           console.error(`Region Step1 failed region=${region} interval=${intervalLabel}:`, step1Err);
         }
 
@@ -7551,6 +7611,11 @@ if (typeof window !== "undefined") {
             region,
             error: String(regionErr?.message || regionErr),
           });
+          appendRunLogError("RUN", "Region analysis failed", {
+            intervalLabel,
+            region,
+            error: String(regionErr?.message || regionErr),
+          });
           console.error(`Region analysis failed region=${region} interval=${intervalLabel}:`, regionErr);
         }
 
@@ -7608,6 +7673,9 @@ if (typeof window !== "undefined") {
           const saveRes = await saveEnvListTxtFromStep1(envListSorted, "EnvList.txt");
           console.log("Step 1 EnvList.txt export:", saveRes);
         } catch (e) {
+          appendRunLogError("RUN", "Step 1 EnvList.txt export failed", {
+            error: String(e?.message || e),
+          });
           console.error("Step 1 EnvList.txt export failed:", e);
         }
 
@@ -7735,6 +7803,9 @@ if (typeof window !== "undefined") {
         console.error("Decision 404 export failed:", finalizeErr);
       }
       if (fatalError) {
+        appendRunLogError("RUN", "Decision404 analysis failed (fatalError)", {
+          error: String(fatalError?.message || fatalError),
+        });
         console.error("Decision 404 analysis failed:", fatalError);
       }
     }
