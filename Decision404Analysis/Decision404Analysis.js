@@ -39,8 +39,8 @@ const ANALYSIS_CONFIG = {
   runLogConsoleLevel: "off",
   step3_2ProgressConsoleEvery: 100,
   step3_3GlobalEnvProgressConsoleEvery: 10,
-  step1RangeStartPst: "2026-05-02T00:00:00-00:00",
-  step1RangeEndPst: "2026-05-02T23:59:59-00:00",
+  step1RangeStartPst: "2026-04-27T00:00:00-00:00",
+  step1RangeEndPst: "2026-05-03T23:59:59-00:00",
   step1MaxIntervalHours: 6,
   step3_3ReuseWindowMinutes: 10,
   step3_3ReuseWindowSeconds: 10,
@@ -5654,7 +5654,7 @@ async function buildStep3_3CacheLoadingByEnv(
               requestUrl: reqUrl || null,
               targetDeploymentID: result?.targetDeploymentID || null,
               conclusion: result?.conclusion || null,
-            });
+            }, "debug");
           }
         } else {
           timelineLookupMissCount += 1;
@@ -5859,7 +5859,7 @@ async function buildStep3_3CacheLoadingByEnv(
     appendRunLog("STEP3.3", "global env analysis progress", {
       env,
       region: regionContext || null,
-      progressScope: "global_interval_envs",
+      progressScope: "global_run_envs",
       processedEnvCount: progress.processedEnvCount,
       totalEnvCount: progress.totalEnvCount,
       progressPct: progress.progressPct,
@@ -6636,6 +6636,7 @@ function buildStep3_4DeploymentCacheCheck(
         "invalid or unexpected URL pattern -> further analysis",
       );
     }
+
   }
 
   const alignedRootCauseTable = [];
@@ -7286,10 +7287,15 @@ async function runStep1ForRegion(region, { envProgressTracker = null, step1Windo
 
 async function runDecision404AnalysisForRegion(
   region,
-  { envProgressTracker = null, step1Result = null, step1Window = null } = {},
+  { envProgressTracker = null, step1Result = null, step1Window = null, allowStep1Fallback = true } = {},
 ) {
   const activeRegion = String(region || "").trim();
   const activeRegionConfig = buildRegionConfig(activeRegion);
+  if (!(step1Result && step1Result.summary) && !allowStep1Fallback) {
+    throw new Error(
+      `Step1 result required but missing for region=${activeRegion} interval=${String(step1Window?.label || "")}`,
+    );
+  }
   const resolvedStep1 =
     step1Result && step1Result.summary
       ? step1Result
@@ -7488,7 +7494,6 @@ if (typeof window !== "undefined") {
 
       for (const intervalWindow of intervalWindows) {
         const intervalLabel = intervalWindow.label;
-        const envProgressTracker = createEnvProgressTracker();
         const step1ByRegion = new Map();
         const intervalBucket = {
           label: intervalLabel,
@@ -7501,22 +7506,19 @@ if (typeof window !== "undefined") {
           step1FailedRegions: [],
           analysisFailedRegions: [],
           isCompleteForExport: false,
+          step1ByRegion,
         };
         intervalBuckets.push(intervalBucket);
 
-        appendRunLog("RUN", "Interval processing started", {
+        appendRunLog("RUN", "Interval Step1 pre-discovery started", {
           intervalLabel,
           intervalIndex: intervalWindow.index,
           intervalStartUtc: new Date(intervalWindow.startMs).toISOString(),
           intervalEndUtc: new Date(intervalWindow.endMs).toISOString(),
           regionCount: regions.length,
-        });
-
-        appendRunLog("RUN", "Step1 pre-discovery started", {
-          intervalLabel,
-          regionCount: regions.length,
           maxParallelRegions,
         });
+
         const step1Results = await mapWithConcurrency(regions, maxParallelRegions, async (region, idx) => {
           const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
           if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
@@ -7551,41 +7553,95 @@ if (typeof window !== "undefined") {
           console.error(`Region Step1 failed region=${region} interval=${intervalLabel}:`, step1Err);
         }
 
-        for (const region of regions) {
-          const step1 = step1ByRegion.get(region);
-          if (!step1) continue;
-          const p = envProgressTracker.registerRegion(region, step1.summary.impactedEnvs.length);
-          appendRunLog("RUN", "Global env progress registered for region", {
+        appendRunLog("RUN", "Interval Step1 pre-discovery completed", {
+          intervalLabel,
+          intervalStartUtc: new Date(intervalWindow.startMs).toISOString(),
+          intervalEndUtc: new Date(intervalWindow.endMs).toISOString(),
+          regionCount: regions.length,
+          regionsWithStep1Success: step1ByRegion.size,
+          step1FailedRegionCount: intervalBucket.step1FailedRegions.length,
+          intervalImpactedEnvCount: [...step1ByRegion.values()].reduce(
+            (sum, step1) => sum + Number(step1?.summary?.impactedEnvs?.length || 0),
+            0,
+          ),
+        });
+
+        if (intervalBucket.step1FailedRegions.length > 0) {
+          const failedRegions = intervalBucket.step1FailedRegions.map(x => String(x?.region || ""));
+          appendRunLogError("RUN", "Interval Step1 pre-discovery failed; interval will be skipped", {
             intervalLabel,
+            intervalStartUtc: new Date(intervalWindow.startMs).toISOString(),
+            intervalEndUtc: new Date(intervalWindow.endMs).toISOString(),
+            failedRegionCount: intervalBucket.step1FailedRegions.length,
+            failedRegions,
+            failedRegionSample: intervalBucket.step1FailedRegions.slice(0, 20),
+          });
+          continue;
+        }
+      }
+
+      const globalRunEnvProgressTracker = createEnvProgressTracker();
+      for (const intervalBucket of intervalBuckets) {
+        for (const [region, step1] of intervalBucket.step1ByRegion.entries()) {
+          const scopeKey = `${intervalBucket.label}|${region}`;
+          const p = globalRunEnvProgressTracker.registerRegion(
+            scopeKey,
+            Number(step1?.summary?.impactedEnvs?.length || 0),
+          );
+          appendRunLog("RUN", "Global run env progress registered for interval-region", {
+            intervalLabel: intervalBucket.label,
             region,
-            regionImpactedEnvCount: step1.summary.impactedEnvs.length,
+            scopeKey,
+            regionImpactedEnvCount: Number(step1?.summary?.impactedEnvs?.length || 0),
             processedEnvCount: p.processedEnvCount,
             totalEnvCount: p.totalEnvCount,
             progressPct: p.progressPct,
           }, "info");
         }
+      }
+      const finalizedGlobalProgress = globalRunEnvProgressTracker.getProgress();
+      appendRunLog("RUN", "Global run env total finalized before Step2/Step3", {
+        processedEnvCount: finalizedGlobalProgress.processedEnvCount,
+        totalEnvCount: finalizedGlobalProgress.totalEnvCount,
+        progressPct: finalizedGlobalProgress.progressPct,
+        intervalCount: intervalBuckets.length,
+      }, "info");
 
-        const finalizedProgress = envProgressTracker.getProgress();
-        appendRunLog("RUN", "Global env total finalized before Step2/Step3", {
+      for (const intervalBucket of intervalBuckets) {
+        const intervalLabel = intervalBucket.label;
+        const step1ByRegion = intervalBucket.step1ByRegion;
+        if (intervalBucket.step1FailedRegions.length > 0) {
+          appendRunLogWarn("RUN", "Interval Step2/Step3 skipped because Step1 failed in this interval", {
+            intervalLabel,
+            intervalStartUtc: new Date(intervalBucket.startMs).toISOString(),
+            intervalEndUtc: new Date(intervalBucket.endMs).toISOString(),
+            step1FailedRegionCount: intervalBucket.step1FailedRegions.length,
+            failedRegions: intervalBucket.step1FailedRegions.map(x => String(x?.region || "")),
+          });
+          continue;
+        }
+
+        appendRunLog("RUN", "Interval Step2/Step3 started", {
           intervalLabel,
-          processedEnvCount: finalizedProgress.processedEnvCount,
-          totalEnvCount: finalizedProgress.totalEnvCount,
-          progressPct: finalizedProgress.progressPct,
+          intervalStartUtc: new Date(intervalBucket.startMs).toISOString(),
+          intervalEndUtc: new Date(intervalBucket.endMs).toISOString(),
           regionsWithStep1Success: step1ByRegion.size,
-        }, "info");
+          step1FailedRegionCount: intervalBucket.step1FailedRegions.length,
+        });
 
         const regionsForAnalysis = regions.filter(region => step1ByRegion.has(region));
         const regionResults = await mapWithConcurrency(
           regionsForAnalysis,
           maxParallelRegions,
           async (region, idx) => {
-          const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
-          if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
-          return runDecision404AnalysisForRegion(region, {
-            envProgressTracker,
-            step1Result: step1ByRegion.get(region),
-            step1Window: intervalWindow,
-          });
+            const waitMs = Math.max(0, Number(ANALYSIS_CONFIG.throttleBetweenRegionsMs || 0));
+            if (waitMs > 0 && idx > 0) await sleepMs(waitMs);
+            return runDecision404AnalysisForRegion(region, {
+              envProgressTracker: globalRunEnvProgressTracker,
+              step1Result: step1ByRegion.get(region),
+              step1Window: intervalBucket,
+              allowStep1Fallback: false,
+            });
           },
         );
 
@@ -7653,11 +7709,9 @@ if (typeof window !== "undefined") {
       try {
         try {
           const summaryEnvSet = new Set();
-          for (const bucket of intervalBuckets) {
-            for (const row of bucket.summaryRows || []) {
-              const env = String(row?.env || "").trim();
-              if (env) summaryEnvSet.add(env);
-            }
+          for (const row of exportSummaryRows) {
+            const env = String(row?.env || "").trim();
+            if (env) summaryEnvSet.add(env);
           }
           const envListSorted = [...allImpactedEnvs]
             .map(x => String(x || "").trim())
@@ -7756,6 +7810,24 @@ if (typeof window !== "undefined") {
         appendRunLog("RUN", "Final CSV excluded interval summary", {
           skippedIntervalCount: skippedIntervalDetails.length,
           skippedIntervals: skippedIntervalDetails,
+        });
+        appendRunLog("RUN", "Run completed interval exclusion summary", {
+          excludedIntervalCount: skippedIntervalDetails.length,
+          excludedIntervals:
+            skippedIntervalDetails.length > 0
+              ? skippedIntervalDetails.map(x => x.intervalLabel)
+              : [],
+          hasExcludedIntervals: skippedIntervalDetails.length > 0,
+        });
+        const completedIntervalLabels = intervalBuckets
+          .filter(bucket => Boolean(bucket?.isCompleteForExport))
+          .map(bucket => String(bucket?.label || ""));
+        const incompletedIntervalLabels = skippedIntervalDetails.map(x => String(x?.intervalLabel || ""));
+        appendRunLog("RUN", "Run completed interval completion summary", {
+          completedIntervalCount: completedIntervalLabels.length,
+          completedIntervals: completedIntervalLabels,
+          incompletedIntervalCount: incompletedIntervalLabels.length,
+          incompletedIntervals: incompletedIntervalLabels,
         });
 
         csvFiles.push({
