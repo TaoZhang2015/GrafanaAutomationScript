@@ -16,13 +16,14 @@ let LOKI_QUERY_SEQ = 0;
 let LAST_API_CALL_AT_MS = 0;
 let ACTIVE_STEP_WINDOW_OVERRIDE_HOURS = null;
 const STEP3_TIMELINE_BUILD_COUNT_BY_CACHE_KEY = new Map();
-const MAX_RUN_LOG_LINES = 20000;
+const MAX_RUN_LOG_LINES = Number.POSITIVE_INFINITY;
 const RUN_LOG_LEVEL_PRIORITY = {
   debug: 10,
   info: 20,
   warn: 30,
   error: 40,
 };
+const AUTHZ_RESTART_LOOKBACK_MINUTES = 10;
 
 // Frequently changed runtime settings
 const ANALYSIS_CONFIG = {
@@ -194,7 +195,7 @@ function appendRunLog(step, message, details = null, level = "info") {
     }
   }
   RUN_LOG_LINES.push(line);
-  if (RUN_LOG_LINES.length > MAX_RUN_LOG_LINES + 1000) {
+  if (Number.isFinite(MAX_RUN_LOG_LINES) && RUN_LOG_LINES.length > MAX_RUN_LOG_LINES + 1000) {
     const overflow = RUN_LOG_LINES.length - MAX_RUN_LOG_LINES;
     RUN_LOG_LINES.splice(0, overflow);
     RUN_LOG_DROPPED_COUNT += overflow;
@@ -5986,7 +5987,7 @@ function buildStep3_4DeploymentCacheCheck(
   authzVersionByEnv = {},
   { step2ByEnv = {} } = {},
 ) {
-  const restartOverrideThresholdNs = 2 * 60 * 1e9;
+  const restartOverrideThresholdNs = AUTHZ_RESTART_LOOKBACK_MINUTES * 60 * 1e9;
 
   function rootCauseExpectedDirection(rootCause) {
     const x = String(rootCause || "");
@@ -6044,6 +6045,97 @@ function buildStep3_4DeploymentCacheCheck(
       String(row?.url || ""),
       String(row?.pod || ""),
     ].join("|");
+  const buildEnvPodKey = (env, pod) => `${String(env || "").trim()}||${String(pod || "N/A").trim() || "N/A"}`;
+  const recordTop3LatestNotFoundByEnvPod = (bucket, { env, pod, traceID, requestedDeploymentID, roundsChecked }) => {
+    const key = buildEnvPodKey(env, pod);
+    if (!bucket.has(key)) {
+      bucket.set(key, {
+        env: String(env || "").trim() || "N/A",
+        pod: String(pod || "N/A").trim() || "N/A",
+        occurrenceCount: 0,
+        maxPostRequestRoundsChecked: 0,
+        sampleTraceIDs: [],
+        sampleRequestedDeploymentIDs: [],
+      });
+    }
+    const item = bucket.get(key);
+    item.occurrenceCount += 1;
+    item.maxPostRequestRoundsChecked = Math.max(
+      Number(item.maxPostRequestRoundsChecked || 0),
+      Number(roundsChecked || 0),
+    );
+    const trace = String(traceID || "").trim();
+    if (trace && item.sampleTraceIDs.length < 3 && !item.sampleTraceIDs.includes(trace)) {
+      item.sampleTraceIDs.push(trace);
+    }
+    const depId = String(requestedDeploymentID || "").trim();
+    if (depId && item.sampleRequestedDeploymentIDs.length < 3 && !item.sampleRequestedDeploymentIDs.includes(depId)) {
+      item.sampleRequestedDeploymentIDs.push(depId);
+    }
+  };
+  const recordPostRequestTargetAppearsByEnvPod = (bucket, { env, pod, traceID, requestedDeploymentID, roundsChecked }) => {
+    const key = buildEnvPodKey(env, pod);
+    if (!bucket.has(key)) {
+      bucket.set(key, {
+        env: String(env || "").trim() || "N/A",
+        pod: String(pod || "N/A").trim() || "N/A",
+        occurrenceCount: 0,
+        maxPostRequestRoundsChecked: 0,
+        sampleTraceIDs: [],
+        sampleRequestedDeploymentIDs: [],
+      });
+    }
+    const item = bucket.get(key);
+    item.occurrenceCount += 1;
+    item.maxPostRequestRoundsChecked = Math.max(
+      Number(item.maxPostRequestRoundsChecked || 0),
+      Number(roundsChecked || 0),
+    );
+    const trace = String(traceID || "").trim();
+    if (trace && item.sampleTraceIDs.length < 3 && !item.sampleTraceIDs.includes(trace)) {
+      item.sampleTraceIDs.push(trace);
+    }
+    const depId = String(requestedDeploymentID || "").trim();
+    if (depId && item.sampleRequestedDeploymentIDs.length < 3 && !item.sampleRequestedDeploymentIDs.includes(depId)) {
+      item.sampleRequestedDeploymentIDs.push(depId);
+    }
+  };
+  const recordRestartPreemptByEnvPod = (
+    bucket,
+    { env, pod, traceID, requestedDeploymentID, restartDeltaSec, restartWithinThresholdSec, sourceTag },
+  ) => {
+    const key = buildEnvPodKey(env, pod);
+    if (!bucket.has(key)) {
+      bucket.set(key, {
+        env: String(env || "").trim() || "N/A",
+        pod: String(pod || "N/A").trim() || "N/A",
+        occurrenceCount: 0,
+        maxRestartDeltaSec: 0,
+        restartWithinThresholdSec: Number(restartWithinThresholdSec || 0),
+        sampleTraceIDs: [],
+        sampleRequestedDeploymentIDs: [],
+        sampleRestartOverrideSources: [],
+      });
+    }
+    const item = bucket.get(key);
+    item.occurrenceCount += 1;
+    item.maxRestartDeltaSec = Math.max(
+      Number(item.maxRestartDeltaSec || 0),
+      Number(restartDeltaSec || 0),
+    );
+    const trace = String(traceID || "").trim();
+    if (trace && item.sampleTraceIDs.length < 3 && !item.sampleTraceIDs.includes(trace)) {
+      item.sampleTraceIDs.push(trace);
+    }
+    const depId = String(requestedDeploymentID || "").trim();
+    if (depId && item.sampleRequestedDeploymentIDs.length < 3 && !item.sampleRequestedDeploymentIDs.includes(depId)) {
+      item.sampleRequestedDeploymentIDs.push(depId);
+    }
+    const source = String(sourceTag || "").trim();
+    if (source && item.sampleRestartOverrideSources.length < 3 && !item.sampleRestartOverrideSources.includes(source)) {
+      item.sampleRestartOverrideSources.push(source);
+    }
+  };
 
   for (const [env, s2] of Object.entries(step2ByEnv || {})) {
     if (!s2?.error) continue;
@@ -6072,6 +6164,9 @@ function buildStep3_4DeploymentCacheCheck(
   }
 
   for (const [env, item] of Object.entries(step3_3ByEnv || {})) {
+    const top3LatestNotFoundByEnvPod = new Map();
+    const postRequestTargetAppearsByEnvPod = new Map();
+    const restartPreemptByEnvPod = new Map();
     for (const link of item.links || []) {
       const request = link.request || {};
       const reqInfo = extractRequestedDeploymentFromUrl(request.url);
@@ -6210,17 +6305,29 @@ function buildStep3_4DeploymentCacheCheck(
           result: resultTag,
           rootCause: "404_due_to_decision_service_restart_cache_warmup",
         });
-        appendRunLog("STEP3.4", "root cause: authz restart within threshold preempts prior classification", {
-          ...decisionLogCtx,
-          result: resultTag,
-          rootCause: "404_due_to_decision_service_restart_cache_warmup",
-          restartOverrideSource: sourceTag,
-          restartWithinThresholdSec: Number((restartOverrideThresholdNs / 1e9).toFixed(3)),
-          restartMatchedLokiTsNs: restartWithinThreshold.matchedRestartTsNs,
-          restartDeltaSec: restartWithinThreshold.deltaSec,
-          restartEvidenceCount: restartWithinThreshold.evidenceCount,
-          ...extra,
-        });
+        if (isRunLogDebugEnabled()) {
+          appendRunLogDebug("STEP3.4", "root cause: authz restart within threshold preempts prior classification", {
+            ...decisionLogCtx,
+            result: resultTag,
+            rootCause: "404_due_to_decision_service_restart_cache_warmup",
+            restartOverrideSource: sourceTag,
+            restartWithinThresholdSec: Number((restartOverrideThresholdNs / 1e9).toFixed(3)),
+            restartMatchedLokiTsNs: restartWithinThreshold.matchedRestartTsNs,
+            restartDeltaSec: restartWithinThreshold.deltaSec,
+            restartEvidenceCount: restartWithinThreshold.evidenceCount,
+            ...extra,
+          });
+        } else {
+          recordRestartPreemptByEnvPod(restartPreemptByEnvPod, {
+            env,
+            pod: baseRow.pod,
+            traceID: baseRow.traceID,
+            requestedDeploymentID: baseRow.requestedDeploymentID,
+            restartDeltaSec: restartWithinThreshold.deltaSec,
+            restartWithinThresholdSec: Number((restartOverrideThresholdNs / 1e9).toFixed(3)),
+            sourceTag,
+          });
+        }
       };
 
       const shouldOverrideToRestart = () => Boolean(restartWithinThreshold.withinThreshold);
@@ -6371,16 +6478,36 @@ function buildStep3_4DeploymentCacheCheck(
           }
           if (link.deploymentListPostRequestCheck?.checked) {
             if (link.deploymentListPostRequestCheck?.foundInCheckedRounds) {
-              pushCacheNotReadyOrRestart(
-                {
+              const postRequestRoundsChecked = link.deploymentListPostRequestCheck?.roundsChecked || 0;
+              if (shouldOverrideToRestart()) {
+                pushRestartOverride("restart_within_2m_preempts_cache_not_ready", "cache_not_ready_yet", {
+                  overriddenResult: "target_deployment_not_ready_in_deployment_list_cache",
+                  overriddenRootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
+                  postRequestRoundsChecked,
+                });
+                continue;
+              }
+              rootCauseTable.push({
+                ...baseRow,
+                result: "target_deployment_not_ready_in_deployment_list_cache",
+                rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
+              });
+              if (isRunLogDebugEnabled()) {
+                appendRunLogDebug("STEP3.4", "root cause: target appears only after request (post-request rounds)", {
+                  ...decisionLogCtx,
                   result: "target_deployment_not_ready_in_deployment_list_cache",
                   rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
-                },
-                "root cause: target appears only after request (post-request rounds)",
-                {
-                  postRequestRoundsChecked: link.deploymentListPostRequestCheck?.roundsChecked || 0,
-                },
-              );
+                  postRequestRoundsChecked,
+                });
+              } else {
+                recordPostRequestTargetAppearsByEnvPod(postRequestTargetAppearsByEnvPod, {
+                  env,
+                  pod: baseRow.pod,
+                  traceID: baseRow.traceID,
+                  requestedDeploymentID: baseRow.requestedDeploymentID,
+                  roundsChecked: postRequestRoundsChecked,
+                });
+              }
               continue;
             }
             rootCauseTable.push({
@@ -6388,16 +6515,26 @@ function buildStep3_4DeploymentCacheCheck(
               result: "requested_deployment_not_in_list_cache",
               rootCause: "404_due_to_deployment_not_in_top_3_list_cache",
             });
-            appendRunLog(
-              "STEP3.4",
-              "root cause: target not found in post-request deployment-list rounds (top3 latest)",
-              {
-                ...decisionLogCtx,
-                result: "requested_deployment_not_in_list_cache",
-                rootCause: "404_due_to_deployment_not_in_top_3_list_cache",
-                postRequestRoundsChecked: link.deploymentListPostRequestCheck?.roundsChecked || 0,
-              },
-            );
+            if (isRunLogDebugEnabled()) {
+              appendRunLogDebug(
+                "STEP3.4",
+                "root cause: target not found in post-request deployment-list rounds (top3 latest)",
+                {
+                  ...decisionLogCtx,
+                  result: "requested_deployment_not_in_list_cache",
+                  rootCause: "404_due_to_deployment_not_in_top_3_list_cache",
+                  postRequestRoundsChecked: link.deploymentListPostRequestCheck?.roundsChecked || 0,
+                },
+              );
+            } else {
+              recordTop3LatestNotFoundByEnvPod(top3LatestNotFoundByEnvPod, {
+                env,
+                pod: baseRow.pod,
+                traceID: baseRow.traceID,
+                requestedDeploymentID: baseRow.requestedDeploymentID,
+                roundsChecked: link.deploymentListPostRequestCheck?.roundsChecked || 0,
+              });
+            }
             continue;
           }
           pushCacheNotReadyOrRestart(
@@ -6637,6 +6774,70 @@ function buildStep3_4DeploymentCacheCheck(
       );
     }
 
+    if (top3LatestNotFoundByEnvPod.size > 0) {
+      const summaries = [...top3LatestNotFoundByEnvPod.values()].sort((a, b) => {
+        if (b.occurrenceCount !== a.occurrenceCount) return b.occurrenceCount - a.occurrenceCount;
+        return a.pod.localeCompare(b.pod);
+      });
+      for (const s of summaries) {
+        appendRunLogWarn(
+          "STEP3.4",
+          "root cause summary: target not found in post-request deployment-list rounds (top3 latest)",
+          {
+            env: s.env,
+            pod: s.pod,
+            occurrenceCount: s.occurrenceCount,
+            maxPostRequestRoundsChecked: s.maxPostRequestRoundsChecked,
+            sampleTraceIDs: s.sampleTraceIDs,
+            sampleRequestedDeploymentIDs: s.sampleRequestedDeploymentIDs,
+            result: "requested_deployment_not_in_list_cache",
+            rootCause: "404_due_to_deployment_not_in_top_3_list_cache",
+          },
+        );
+      }
+    }
+    if (postRequestTargetAppearsByEnvPod.size > 0) {
+      const summaries = [...postRequestTargetAppearsByEnvPod.values()].sort((a, b) => {
+        if (b.occurrenceCount !== a.occurrenceCount) return b.occurrenceCount - a.occurrenceCount;
+        return a.pod.localeCompare(b.pod);
+      });
+      for (const s of summaries) {
+        appendRunLogWarn(
+          "STEP3.4",
+          "root cause summary: target appears only after request (post-request rounds)",
+          {
+            env: s.env,
+            pod: s.pod,
+            occurrenceCount: s.occurrenceCount,
+            maxPostRequestRoundsChecked: s.maxPostRequestRoundsChecked,
+            sampleTraceIDs: s.sampleTraceIDs,
+            sampleRequestedDeploymentIDs: s.sampleRequestedDeploymentIDs,
+            result: "target_deployment_not_ready_in_deployment_list_cache",
+            rootCause: "404_due_to_deployment_not_ready_in_deployment_list_cache",
+          },
+        );
+      }
+    }
+    if (restartPreemptByEnvPod.size > 0) {
+      const summaries = [...restartPreemptByEnvPod.values()].sort((a, b) => {
+        if (b.occurrenceCount !== a.occurrenceCount) return b.occurrenceCount - a.occurrenceCount;
+        return a.pod.localeCompare(b.pod);
+      });
+      for (const s of summaries) {
+        appendRunLogWarn("STEP3.4", "root cause summary: authz restart within threshold preempts prior classification", {
+          env: s.env,
+          pod: s.pod,
+          occurrenceCount: s.occurrenceCount,
+          restartWithinThresholdSec: s.restartWithinThresholdSec,
+          maxRestartDeltaSec: s.maxRestartDeltaSec,
+          sampleRestartOverrideSources: s.sampleRestartOverrideSources,
+          sampleTraceIDs: s.sampleTraceIDs,
+          sampleRequestedDeploymentIDs: s.sampleRequestedDeploymentIDs,
+          result: "restart_within_2m_preempts_prior_classification",
+          rootCause: "404_due_to_decision_service_restart_cache_warmup",
+        });
+      }
+    }
   }
 
   const alignedRootCauseTable = [];
@@ -6812,7 +7013,7 @@ async function runMandatoryFurtherAnalysisLokiChecks(
 ) {
   const queryLokiForStep = typeof queryLokiFn === "function" ? queryLokiFn : queryLoki;
   const rows = step3_4Result?.furtherAnalysisTable || [];
-  const lookbackMinutes = 10;
+  const lookbackMinutes = AUTHZ_RESTART_LOOKBACK_MINUTES;
   const lookbackNs = lookbackMinutes * 60 * 1e9;
   const evidenceByCaseKey = {};
   const queryResultCache = new Map();
